@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Map as MapIcon, Settings, Eye, EyeOff, Info, CheckCircle2, Search, ZoomIn, ZoomOut, Menu, GitCommit, HelpCircle, RefreshCw } from 'lucide-react';
+import Papa from 'papaparse';
 
 export default function App() {
   const [appState, setAppState] = useState('setup'); // 'setup', 'loading', 'map'
+  const [csvLoading, setCsvLoading] = useState(false);
   const [imageSrc, setImageSrc] = useState(null);
 
   // Split data to handle both types
@@ -25,6 +27,26 @@ export default function App() {
   // State to hold user-configured track merges (childBCID -> parentBCID)
   const [merges, setMerges] = useState({});
   const [hoveredSuggestion, setHoveredSuggestion] = useState(null);
+
+  // Stitch finder configurable thresholds
+  const [maxTimeGapSec, setMaxTimeGapSec] = useState(15);
+  const [maxDistPx, setMaxDistPx] = useState(120);
+
+  // Expanded stitch pair detail view
+  const [expandedSuggestion, setExpandedSuggestion] = useState(null);
+
+  // Hidden stitch pairs (by suggestion id)
+  const [hiddenPairs, setHiddenPairs] = useState(new Set());
+
+  // Legend sort: 'default' | 'points-desc' | 'points-asc' | 'duration-desc' | 'duration-asc'
+  const [legendSort, setLegendSort] = useState('points-desc');
+
+  // Pattern analysis
+  const [gridCols, setGridCols] = useState(6);
+  const [gridRows, setGridRows] = useState(4);
+  const [dwellRadiusPx, setDwellRadiusPx] = useState(50);
+  const [dwellMinSec, setDwellMinSec] = useState(5);
+  const [showZoneOverlay, setShowZoneOverlay] = useState(false);
 
   // Helper to trace up the merge tree to find the ultimate parent track representative
   const getMergedRepresentative = (bcid, currentMerges) => {
@@ -49,21 +71,52 @@ export default function App() {
     return csvData[dataSource] || [];
   }, [csvData, dataSource]);
 
+  // RFC 4180-compliant CSV row splitter (handles "" escaped quotes inside quoted fields)
+  const splitCSVRow = (line) => {
+    const fields = [];
+    let val = '';
+    let inQuotes = false;
+    for (let j = 0; j < line.length; j++) {
+      const c = line[j];
+      if (inQuotes) {
+        if (c === '"') {
+          if (line[j + 1] === '"') { val += '"'; j++; } // escaped ""
+          else inQuotes = false;                          // end of quoted field
+        } else {
+          val += c;
+        }
+      } else {
+        if (c === '"') { inQuotes = true; }
+        else if (c === ',') { fields.push(val); val = ''; }
+        else { val += c; }
+      }
+    }
+    fields.push(val);
+    return fields;
+  };
+
   // Parse CSV function for both Body and Touch points
   const parseCSV = (text) => {
-    const lines = text.split('\n');
-    if (lines.length < 1) return { body: [], touches: [] };
+    // Strip UTF-8 BOM and normalize line endings
+    const normalized = text.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = normalized.split('\n');
+    if (lines.length < 2) return { body: [], touches: [] };
 
-    const headerLine = lines[0];
-    const headers = headerLine.split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    const headers = splitCSVRow(lines[0]).map(h => h.trim().toLowerCase());
+    console.log('[CSV] headers:', headers);
+    console.log('[CSV] total lines:', lines.length);
 
-    const bcidIdx = headers.indexOf('bcid');
-    const floorPtIdx = headers.indexOf('floor_pt_fused');
     const eventTsIdx = headers.indexOf('event_ts');
+    const outputsIdx = headers.indexOf('outputs');
+    // flat fallback columns (single-output rows)
+    const bcidIdx    = headers.indexOf('bcid');
+    const floorPtIdx = headers.indexOf('floor_pt_fused');
     const touchesIdx = headers.indexOf('touches');
 
-    if (bcidIdx === -1) {
-      alert("Error: The CSV file must contain a 'bcid' column.");
+    console.log('[CSV] outputsIdx:', outputsIdx, 'bcidIdx:', bcidIdx, 'floorPtIdx:', floorPtIdx);
+
+    if (bcidIdx === -1 && outputsIdx === -1) {
+      alert(`Error: Could not find a 'bcid' or 'outputs' column.\nColumns found: ${headers.join(', ')}`);
       return { body: [], touches: [] };
     }
 
@@ -71,55 +124,76 @@ export default function App() {
     const touchPoints = [];
     let isNormalized = true;
 
+    const addBody = (id, bcid, x, y, timestamp) => {
+      if (x > 2 || y > 2) isNormalized = false;
+      bodyPoints.push({ id, rowIndex: id, bcid, rawX: x, rawY: y, timestamp, type: 'body' });
+    };
+
     for (let i = 1; i < lines.length; i++) {
       if (!lines[i].trim()) continue;
+      const row = splitCSVRow(lines[i]);
 
-      const row = [];
-      let inQuotes = false;
-      let val = '';
-      for (let j = 0; j < lines[i].length; j++) {
-        const c = lines[i][j];
-        if (c === '"') inQuotes = !inQuotes;
-        else if (c === ',' && !inQuotes) { row.push(val); val = ''; }
-        else val += c;
-      }
-      row.push(val);
-
-      const bcid = row[bcidIdx]?.replace(/^"|"$/g, '');
-      if (!bcid) continue;
-
-      const tsStr = eventTsIdx !== -1 ? row[eventTsIdx]?.replace(/^"|"$/g, '') : null;
+      const tsStr = eventTsIdx !== -1 ? row[eventTsIdx] : null;
       const timestamp = tsStr ? new Date(tsStr).getTime() : i * 100;
 
-      // 1. Process Body Detections (floor_pt_fused)
-      if (floorPtIdx !== -1 && row[floorPtIdx]) {
-        const match = row[floorPtIdx].match(/\[\s*([\d.-]+)\s*,\s*([\d.-]+)/);
-        if (match) {
-          const x = parseFloat(match[1]);
-          const y = parseFloat(match[2]);
-          if (x > 2 || y > 2) isNormalized = false;
-          bodyPoints.push({ id: `b${i}`, rowIndex: i, bcid, rawX: x, rawY: y, timestamp, type: 'body' });
+      // 1. Try to extract multiple bcids from the `outputs` JSON column
+      let extractedFromOutputs = false;
+      if (outputsIdx !== -1 && row[outputsIdx]) {
+        try {
+          if (i === 1) console.log('[CSV] row 1 col count:', row.length, 'outputs snippet:', row[outputsIdx]?.slice(0, 100));
+          const outputs = JSON.parse(row[outputsIdx]);
+          if (Array.isArray(outputs)) {
+            outputs.forEach((entry, oIdx) => {
+              const bcid = entry.bcid;
+              const fp = entry.floor_pt_fused;
+              if (bcid && Array.isArray(fp) && fp.length >= 2) {
+                addBody(`b${i}-${oIdx}`, bcid, parseFloat(fp[0]), parseFloat(fp[1]), timestamp);
+                extractedFromOutputs = true;
+              }
+              // Touch points nested inside outputs
+              if (entry.touches && Array.isArray(entry.touches)) {
+                entry.touches.forEach((touch, tIdx) => {
+                  const fp2 = touch.floor_pt;
+                  if (fp2 && fp2.x != null && fp2.y != null) {
+                    const tx = parseFloat(fp2.x), ty = parseFloat(fp2.y);
+                    if (tx > 2 || ty > 2) isNormalized = false;
+                    touchPoints.push({ id: `t${i}-${oIdx}-${tIdx}`, rowIndex: i, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
+                  }
+                });
+              }
+            });
+          }
+        } catch (err) {
+          if (i === 1) console.error('[CSV] JSON.parse failed on row 1 outputs:', err.message, row[outputsIdx]?.slice(0, 200));
         }
       }
 
-      // 2. Process Touch Points (extracting nested floor_pt from touches column)
-      if (touchesIdx !== -1 && row[touchesIdx] && row[touchesIdx].trim() !== '') {
-        const touchMatches = [...row[touchesIdx].matchAll(/floor_pt[^\w\{]*\{([^}]+)\}/g)];
-        touchMatches.forEach((tm, tIdx) => {
-          const innerProps = tm[1];
-          const xMatch = innerProps.match(/x\\?["']?\s*:\s*([\d.-]+)/);
-          const yMatch = innerProps.match(/y\\?["']?\s*:\s*([\d.-]+)/);
+      // 2. Flat column fallback (if outputs parsing didn't yield anything)
+      if (!extractedFromOutputs) {
+        const bcid = bcidIdx !== -1 ? row[bcidIdx] : null;
+        if (!bcid) continue;
 
-          if (xMatch && yMatch) {
-            const tx = parseFloat(xMatch[1]);
-            const ty = parseFloat(yMatch[1]);
-            if (tx > 2 || ty > 2) isNormalized = false;
-            touchPoints.push({ id: `t${i}-${tIdx}`, rowIndex: i, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
-          }
-        });
+        if (floorPtIdx !== -1 && row[floorPtIdx]) {
+          const match = row[floorPtIdx].match(/\[\s*([\d.-]+)\s*,\s*([\d.-]+)/);
+          if (match) addBody(`b${i}`, bcid, parseFloat(match[1]), parseFloat(match[2]), timestamp);
+        }
+
+        if (touchesIdx !== -1 && row[touchesIdx]) {
+          const touchMatches = [...row[touchesIdx].matchAll(/floor_pt[^\w{]*\{([^}]+)\}/g)];
+          touchMatches.forEach((tm, tIdx) => {
+            const xM = tm[1].match(/x\\?["']?\s*:\s*([\d.-]+)/);
+            const yM = tm[1].match(/y\\?["']?\s*:\s*([\d.-]+)/);
+            if (xM && yM) {
+              const tx = parseFloat(xM[1]), ty = parseFloat(yM[1]);
+              if (tx > 2 || ty > 2) isNormalized = false;
+              touchPoints.push({ id: `t${i}-${tIdx}`, rowIndex: i, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
+            }
+          });
+        }
       }
     }
 
+    console.log('[CSV] parsed body:', bodyPoints.length, 'touches:', touchPoints.length, 'sample:', bodyPoints[0]);
     setScaleCoordinates(isNormalized);
     return { body: bodyPoints, touches: touchPoints };
   };
@@ -142,26 +216,116 @@ export default function App() {
   const handleCsvUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const parsedData = parseCSV(event.target.result);
 
-      const colors = {};
-      const allUniqueBcids = [...new Set([
-        ...parsedData.body.map(d => d.bcid),
-        ...parsedData.touches.map(d => d.bcid)
-      ])];
+    const bodyPoints = [];
+    const touchPoints = [];
+    let isNormalized = true;
+    let rowIndex = 0;
+    let headers = null;
+    let eventTsIdx, outputsIdx, bcidIdx, floorPtIdx, touchesIdx;
 
-      allUniqueBcids.forEach((id, index) => {
-        const hue = Math.floor((index / allUniqueBcids.length) * 360);
-        colors[id] = `hsl(${hue}, 75%, 75%)`;
-      });
-
-      setBcidColors(colors);
-      setCsvData(parsedData);
-      setMerges({}); // Reset any merges from previous data
+    const addBody = (id, bcid, x, y, timestamp) => {
+      if (x > 2 || y > 2) isNormalized = false;
+      bodyPoints.push({ id, rowIndex: id, bcid, rawX: x, rawY: y, timestamp, type: 'body' });
     };
-    reader.readAsText(file);
+
+    setCsvLoading(true);
+    Papa.parse(file, {
+      header: false,
+      skipEmptyLines: true,
+      worker: false,
+      chunk(results) {
+        for (const row of results.data) {
+          // First row = headers
+          if (headers === null) {
+            headers = row.map(h => h.trim().toLowerCase());
+            eventTsIdx  = headers.indexOf('event_ts');
+            outputsIdx  = headers.indexOf('outputs');
+            bcidIdx     = headers.indexOf('bcid');
+            floorPtIdx  = headers.indexOf('floor_pt_fused');
+            touchesIdx  = headers.indexOf('touches');
+            console.log('[CSV] outputsIdx:', outputsIdx, 'bcidIdx:', bcidIdx, 'floorPtIdx:', floorPtIdx);
+            continue;
+          }
+
+          rowIndex++;
+          const tsStr = eventTsIdx !== -1 ? row[eventTsIdx] : null;
+          const timestamp = tsStr ? new Date(tsStr).getTime() : rowIndex * 100;
+
+          // Try outputs JSON first (multiple BCIDs per row)
+          let extractedFromOutputs = false;
+          if (outputsIdx !== -1 && row[outputsIdx]) {
+            try {
+              const outputs = JSON.parse(row[outputsIdx]);
+              if (Array.isArray(outputs)) {
+                outputs.forEach((entry, oIdx) => {
+                  const bcid = entry.bcid;
+                  const fp = entry.floor_pt_fused;
+                  if (bcid && Array.isArray(fp) && fp.length >= 2) {
+                    addBody(`b${rowIndex}-${oIdx}`, bcid, parseFloat(fp[0]), parseFloat(fp[1]), timestamp);
+                    extractedFromOutputs = true;
+                  }
+                  if (entry.touches && Array.isArray(entry.touches)) {
+                    entry.touches.forEach((touch, tIdx) => {
+                      const fp2 = touch.floor_pt;
+                      if (fp2?.x != null && fp2?.y != null) {
+                        const tx = parseFloat(fp2.x), ty = parseFloat(fp2.y);
+                        if (tx > 2 || ty > 2) isNormalized = false;
+                        touchPoints.push({ id: `t${rowIndex}-${oIdx}-${tIdx}`, rowIndex, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
+                      }
+                    });
+                  }
+                });
+              }
+            } catch (_) { /* fall through to flat columns */ }
+          }
+
+          // Flat column fallback
+          if (!extractedFromOutputs && bcidIdx !== -1) {
+            const bcid = row[bcidIdx];
+            if (!bcid) continue;
+            if (floorPtIdx !== -1 && row[floorPtIdx]) {
+              const match = row[floorPtIdx].match(/\[\s*([\d.-]+)\s*,\s*([\d.-]+)/);
+              if (match) addBody(`b${rowIndex}`, bcid, parseFloat(match[1]), parseFloat(match[2]), timestamp);
+            }
+            if (touchesIdx !== -1 && row[touchesIdx]) {
+              const touchMatches = [...row[touchesIdx].matchAll(/floor_pt[^\w{]*\{([^}]+)\}/g)];
+              touchMatches.forEach((tm, tIdx) => {
+                const xM = tm[1].match(/x\\?["']?\s*:\s*([\d.-]+)/);
+                const yM = tm[1].match(/y\\?["']?\s*:\s*([\d.-]+)/);
+                if (xM && yM) {
+                  const tx = parseFloat(xM[1]), ty = parseFloat(yM[1]);
+                  if (tx > 2 || ty > 2) isNormalized = false;
+                  touchPoints.push({ id: `t${rowIndex}-${tIdx}`, rowIndex, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
+                }
+              });
+            }
+          }
+        }
+      },
+      complete() {
+        setCsvLoading(false);
+        console.log('[CSV] done — body:', bodyPoints.length, 'touches:', touchPoints.length, 'sample:', bodyPoints[0]);
+        if (bodyPoints.length === 0 && touchPoints.length === 0) {
+          alert('No tracking data found. Check that the CSV has a valid outputs or bcid column.');
+          return;
+        }
+        const parsedData = { body: bodyPoints, touches: touchPoints };
+        const colors = {};
+        const allUniqueBcids = [...new Set([...bodyPoints.map(d => d.bcid), ...touchPoints.map(d => d.bcid)])];
+        allUniqueBcids.forEach((id, index) => {
+          colors[id] = `hsl(${Math.floor((index / allUniqueBcids.length) * 360)}, 75%, 75%)`;
+        });
+        setScaleCoordinates(isNormalized);
+        setBcidColors(colors);
+        setCsvData(parsedData);
+        setMerges({});
+      },
+      error(err) {
+        setCsvLoading(false);
+        alert('Failed to parse CSV: ' + err.message);
+      },
+    });
   };
 
   // Analyze CSV endpoints to find connectable paths
@@ -188,8 +352,8 @@ export default function App() {
     });
 
     const suggestions = [];
-    const maxTimeGapMs = 15000; // 15 seconds threshold
-    const maxDistPixels = 120; // Maximum distance to consider
+    const maxTimeGapMs = maxTimeGapSec * 1000;
+    const maxDistPixels = maxDistPx;
 
     // Match end of A to start of B
     for (let i = 0; i < bounds.length; i++) {
@@ -223,7 +387,119 @@ export default function App() {
 
     // Sort by proximity score (closer in space + time is ranked higher)
     return suggestions.sort((a, b) => (a.distance + a.timeGapMs / 500) - (b.distance + b.timeGapMs / 500));
-  }, [csvData.body, scaleCoordinates, resolution]);
+  }, [csvData.body, scaleCoordinates, resolution, maxTimeGapSec, maxDistPx]);
+
+  // Helper: resolve pixel coords from a raw point
+  const toPixel = (pt) => ({
+    x: scaleCoordinates ? pt.rawX * resolution.width : pt.rawX,
+    y: scaleCoordinates ? pt.rawY * resolution.height : pt.rawY,
+  });
+
+  // Zone id from pixel coords
+  const getZoneId = (x, y) => {
+    const col = Math.min(Math.floor(x / resolution.width * gridCols), gridCols - 1);
+    const row = Math.min(Math.floor(y / resolution.height * gridRows), gridRows - 1);
+    return `${col}:${row}`;
+  };
+
+  // Dwell segments per BCID
+  const dwellSegments = useMemo(() => {
+    const result = {};
+    const tracks = {};
+    csvData.body.forEach(pt => {
+      if (!tracks[pt.bcid]) tracks[pt.bcid] = [];
+      tracks[pt.bcid].push(pt);
+    });
+
+    Object.entries(tracks).forEach(([bcid, pts]) => {
+      const sorted = [...pts].sort((a, b) => a.timestamp - b.timestamp).map(p => ({ ...p, ...toPixel(p) }));
+      result[bcid] = [];
+      let i = 0;
+      while (i < sorted.length) {
+        const anchor = sorted[i];
+        let j = i + 1;
+        while (j < sorted.length && Math.hypot(sorted[j].x - anchor.x, sorted[j].y - anchor.y) <= dwellRadiusPx) j++;
+        const durationMs = sorted[j - 1].timestamp - anchor.timestamp;
+        if (durationMs >= dwellMinSec * 1000 && j - i >= 3) {
+          // centroid of dwell cluster
+          const cx = sorted.slice(i, j).reduce((s, p) => s + p.x, 0) / (j - i);
+          const cy = sorted.slice(i, j).reduce((s, p) => s + p.y, 0) / (j - i);
+          result[bcid].push({
+            zoneId: getZoneId(cx, cy),
+            startTs: anchor.timestamp,
+            endTs: sorted[j - 1].timestamp,
+            durationMs,
+            centroid: { x: cx, y: cy },
+            pointCount: j - i,
+          });
+          i = j;
+        } else {
+          i++;
+        }
+      }
+    });
+    return result;
+  }, [csvData.body, scaleCoordinates, resolution, dwellRadiusPx, dwellMinSec, gridCols, gridRows]);
+
+  // Zone transition matrix + zone traffic density
+  const { transitionMatrix, zoneDensity } = useMemo(() => {
+    const counts = {};
+    const fromCounts = {};
+    const density = {};
+
+    const tracks = {};
+    csvData.body.forEach(pt => {
+      if (!tracks[pt.bcid]) tracks[pt.bcid] = [];
+      tracks[pt.bcid].push(pt);
+    });
+
+    Object.values(tracks).forEach(pts => {
+      const sorted = [...pts].sort((a, b) => a.timestamp - b.timestamp);
+      let prevZone = null;
+      sorted.forEach(pt => {
+        const { x, y } = toPixel(pt);
+        const zone = getZoneId(x, y);
+        density[zone] = (density[zone] || 0) + 1;
+        if (prevZone && prevZone !== zone) {
+          const key = `${prevZone}->${zone}`;
+          counts[key] = (counts[key] || 0) + 1;
+          fromCounts[prevZone] = (fromCounts[prevZone] || 0) + 1;
+        }
+        prevZone = zone;
+      });
+    });
+
+    const matrix = {};
+    Object.entries(counts).forEach(([key, count]) => {
+      const [from] = key.split('->');
+      matrix[key] = count / (fromCounts[from] || 1);
+    });
+
+    return { transitionMatrix: matrix, zoneDensity: density };
+  }, [csvData.body, scaleCoordinates, resolution, gridCols, gridRows]);
+
+  // Pattern score per stitch suggestion (0–100)
+  const patternScores = useMemo(() => {
+    const maxGapMs = maxTimeGapSec * 1000;
+    const scores = {};
+    stitchSuggestions.forEach(sug => {
+      const timeScore = 1 - Math.min(sug.timeGapMs / maxGapMs, 1);
+      const distScore = 1 - Math.min(sug.distance / maxDistPx, 1);
+
+      const zoneA = getZoneId(sug.fromPt.x, sug.fromPt.y);
+      const zoneB = getZoneId(sug.toPt.x, sug.toPt.y);
+      const transProb = zoneA === zoneB ? 1 : (transitionMatrix[`${zoneA}->${zoneB}`] || 0);
+
+      // Dwell bonus: track A ends with a dwell
+      const dwellsA = dwellSegments[sug.from] || [];
+      const lastDwell = dwellsA[dwellsA.length - 1];
+      const dwellBonus = lastDwell && (sug.fromPt ? Math.hypot(lastDwell.centroid.x - sug.fromPt.x, lastDwell.centroid.y - sug.fromPt.y) < dwellRadiusPx * 1.5 : false) ? 1 : 0;
+
+      const raw = (timeScore * 0.3 + distScore * 0.3 + transProb * 0.25 + dwellBonus * 0.15);
+      scores[sug.id] = Math.round(raw * 100);
+    });
+    return scores;
+  }, [stitchSuggestions, transitionMatrix, dwellSegments, maxTimeGapSec, maxDistPx, dwellRadiusPx, gridCols, gridRows]);
 
   // Dynamically calculate stats for the ACTIVE data source taking merges into account
   const bcidStats = useMemo(() => {
@@ -301,6 +577,32 @@ export default function App() {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+    // 0. Zone overlay
+    if (showZoneOverlay && Object.keys(zoneDensity).length > 0) {
+      const maxDensity = Math.max(...Object.values(zoneDensity));
+      const cellW = canvas.width / gridCols;
+      const cellH = canvas.height / gridRows;
+      for (let c = 0; c < gridCols; c++) {
+        for (let r = 0; r < gridRows; r++) {
+          const zid = `${c}:${r}`;
+          const d = zoneDensity[zid] || 0;
+          const alpha = d > 0 ? 0.1 + (d / maxDensity) * 0.45 : 0;
+          ctx.fillStyle = `rgba(99, 102, 241, ${alpha})`;
+          ctx.fillRect(c * cellW, r * cellH, cellW, cellH);
+          ctx.strokeStyle = 'rgba(99, 102, 241, 0.15)';
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(c * cellW, r * cellH, cellW, cellH);
+          if (d > 0) {
+            ctx.fillStyle = 'rgba(30,30,80,0.55)';
+            ctx.font = `${Math.max(9, Math.min(cellW, cellH) * 0.22)}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(d, c * cellW + cellW / 2, r * cellH + cellH / 2);
+          }
+        }
+      }
+    }
+
     // 1. If hovering over a suggested connection, draw a bright interactive link
     if (hoveredSuggestion) {
       const { fromPt, toPt } = hoveredSuggestion;
@@ -329,9 +631,19 @@ export default function App() {
       groupedData[repBcid].push(point);
     });
 
+    // BCIDs hidden via pair toggles
+    const pairHiddenBcids = new Set();
+    stitchSuggestions.forEach(sug => {
+      if (hiddenPairs.has(sug.id)) {
+        pairHiddenBcids.add(getMergedRepresentative(sug.from, merges));
+        pairHiddenBcids.add(getMergedRepresentative(sug.to, merges));
+      }
+    });
+
     // 3. Render the paths
     Object.entries(groupedData).forEach(([repBcid, points]) => {
       if (hiddenBcids.has(repBcid)) return;
+      if (pairHiddenBcids.has(repBcid)) return;
       if (searchQuery && !repBcid.toLowerCase().includes(searchQuery.toLowerCase())) return;
 
       const color = bcidColors[repBcid] || '#ccc';
@@ -439,7 +751,7 @@ export default function App() {
         }
       }
     });
-  }, [appState, displayData, hiddenBcids, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion]);
+  }, [appState, displayData, hiddenBcids, hiddenPairs, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion, stitchSuggestions, showZoneOverlay, zoneDensity, gridCols, gridRows]);
 
   // Handle Mouse Hover for Tooltips
   const handleMouseMove = (e) => {
@@ -521,16 +833,22 @@ export default function App() {
               </label>
             </div>
 
-            <div className={`border-2 border-dashed rounded-xl p-6 transition-colors ${(csvData.body.length > 0 || csvData.touches.length > 0) ? 'border-green-400 bg-green-50' : 'border-slate-300 hover:border-indigo-400 bg-slate-50'}`}>
+            <div className={`border-2 border-dashed rounded-xl p-6 transition-colors ${(csvData.body.length > 0 || csvData.touches.length > 0) ? 'border-green-400 bg-green-50' : csvLoading ? 'border-indigo-300 bg-indigo-50' : 'border-slate-300 hover:border-indigo-400 bg-slate-50'}`}>
               <label className="flex flex-col items-center cursor-pointer">
-                {(csvData.body.length > 0 || csvData.touches.length > 0) ? <CheckCircle2 className="text-green-500 w-10 h-10 mb-2" /> : <Upload className="text-slate-400 w-10 h-10 mb-2" />}
+                {csvLoading
+                  ? <div className="w-10 h-10 mb-2 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
+                  : (csvData.body.length > 0 || csvData.touches.length > 0)
+                    ? <CheckCircle2 className="text-green-500 w-10 h-10 mb-2" />
+                    : <Upload className="text-slate-400 w-10 h-10 mb-2" />}
                 <span className="text-sm font-medium text-slate-700">
-                  {(csvData.body.length > 0 || csvData.touches.length > 0)
-                    ? `CSV Loaded: ${csvData.body.length} bodies, ${csvData.touches.length} touches`
-                    : '2. Upload Tracking Data (CSV)'}
+                  {csvLoading
+                    ? 'Parsing CSV… (large files may take a moment)'
+                    : (csvData.body.length > 0 || csvData.touches.length > 0)
+                      ? `CSV Loaded: ${csvData.body.length} bodies, ${csvData.touches.length} touches`
+                      : '2. Upload Tracking Data (CSV)'}
                 </span>
                 <span className="text-xs text-slate-500 mt-1">Must contain 'bcid', 'floor_pt_fused', and optionally 'touches'</span>
-                <input type="file" accept=".csv" className="hidden" onChange={handleCsvUpload} />
+                <input type="file" accept=".csv" className="hidden" onChange={handleCsvUpload} disabled={csvLoading} />
               </label>
             </div>
 
@@ -740,12 +1058,18 @@ export default function App() {
                   </span>
                 )}
               </button>
+              <button
+                onClick={() => setSidebarTab('pattern')}
+                className={`flex-1 py-2 text-xs font-bold rounded-md transition-all flex items-center justify-center gap-1.5 ${sidebarTab === 'pattern' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500 hover:text-slate-800'}`}
+              >
+                <Search className="w-3.5 h-3.5" /> Pattern
+              </button>
             </div>
 
             <div className="p-4 flex-1 overflow-y-auto">
               {sidebarTab === 'legend' ? (
                 <>
-                  <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center justify-between mb-3">
                     <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Active Paths</h3>
                     <button
                       onClick={toggleAllBcids}
@@ -753,6 +1077,24 @@ export default function App() {
                     >
                       {hiddenBcids.size === 0 ? 'Hide All' : 'Show All'}
                     </button>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 mb-3">
+                    <span className="text-[11px] text-slate-400 shrink-0">Sort:</span>
+                    {[
+                      { key: 'points-desc', label: 'Most Points' },
+                      { key: 'points-asc',  label: 'Least Points' },
+                      { key: 'duration-desc', label: 'Longest' },
+                      { key: 'duration-asc',  label: 'Shortest' },
+                    ].map(opt => (
+                      <button
+                        key={opt.key}
+                        onClick={() => setLegendSort(opt.key)}
+                        className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors font-medium ${legendSort === opt.key ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-400'}`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
                   </div>
 
                   <div className="mb-4 relative">
@@ -769,6 +1111,15 @@ export default function App() {
                   <div className="space-y-2">
                     {Object.entries(bcidStats)
                       .filter(([bcid]) => !searchQuery || bcid.toLowerCase().includes(searchQuery.toLowerCase()))
+                      .sort(([, a], [, b]) => {
+                        const durA = a.maxTs - a.minTs || 0;
+                        const durB = b.maxTs - b.minTs || 0;
+                        if (legendSort === 'points-desc') return b.count - a.count;
+                        if (legendSort === 'points-asc')  return a.count - b.count;
+                        if (legendSort === 'duration-desc') return durB - durA;
+                        if (legendSort === 'duration-asc')  return durA - durB;
+                        return 0;
+                      })
                       .map(([bcid, stats]) => {
                       const color = bcidColors[bcid];
                       const isHidden = hiddenBcids.has(bcid);
@@ -812,56 +1163,172 @@ export default function App() {
                     )}
                   </div>
                 </>
-              ) : (
+              ) : sidebarTab === 'stitcher' ? (
                 <>
                   <div className="mb-3 p-3 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-slate-600 space-y-1.5">
                     <div className="font-bold text-indigo-800 flex items-center gap-1.5">
                       <Info className="w-4 h-4 text-indigo-600" /> Chronological Stitch Finder
                     </div>
                     <p className="leading-relaxed">
-                      Scans coordinates and event timestamps to identify separate track segments that ended and started within 15 seconds and 120 pixels of each other.
+                      Scans coordinates and event timestamps to identify separate track segments that ended and started close in time and space.
                     </p>
                   </div>
 
-                  <div className="space-y-2 mt-4">
+                  {/* Configurable thresholds */}
+                  <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+                    <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Thresholds</div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-slate-600 w-28 shrink-0">Max Time Gap</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={300}
+                        value={maxTimeGapSec}
+                        onChange={e => setMaxTimeGapSec(Math.max(1, Number(e.target.value)))}
+                        className="w-16 px-2 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white"
+                      />
+                      <span className="text-xs text-slate-400">seconds</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-slate-600 w-28 shrink-0">Max Distance</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={2000}
+                        value={maxDistPx}
+                        onChange={e => setMaxDistPx(Math.max(1, Number(e.target.value)))}
+                        className="w-16 px-2 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white"
+                      />
+                      <span className="text-xs text-slate-400">pixels</span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
                     {stitchSuggestions.map((sug) => {
                       const isAlreadyStitched = getMergedRepresentative(sug.to, merges) === getMergedRepresentative(sug.from, merges);
+                      const isExpanded = expandedSuggestion === sug.id;
+                      const isPairHidden = hiddenPairs.has(sug.id);
+
+                      // Gather per-track stats for detail view
+                      const trackAPoints = csvData.body.filter(p => p.bcid === sug.from).sort((a,b) => a.timestamp - b.timestamp);
+                      const trackBPoints = csvData.body.filter(p => p.bcid === sug.to).sort((a,b) => a.timestamp - b.timestamp);
+                      const fmtTs = (ts) => ts ? new Date(ts).toLocaleTimeString() : '—';
 
                       return (
                         <div
                           key={sug.id}
                           onMouseEnter={() => setHoveredSuggestion(sug)}
                           onMouseLeave={() => setHoveredSuggestion(null)}
-                          className={`p-3 border rounded-lg transition-all flex flex-col justify-between gap-2 bg-white ${isAlreadyStitched ? 'border-green-200 bg-green-50/20' : 'border-slate-200 hover:border-indigo-300 hover:shadow-sm'}`}
+                          className={`border rounded-lg transition-all flex flex-col bg-white ${isPairHidden ? 'opacity-50' : ''} ${isAlreadyStitched ? 'border-green-200 bg-green-50/20' : 'border-slate-200 hover:border-indigo-300 hover:shadow-sm'}`}
                         >
-                          <div className="flex items-center justify-between">
-                            <div className="flex flex-col max-w-[70%]">
-                              <span className="text-xs font-bold text-slate-700 truncate" title={sug.from}>{sug.from}</span>
-                              <span className="text-[10px] text-slate-400 font-medium">ended</span>
+                          {/* Card header */}
+                          <div className="p-3 flex flex-col gap-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex flex-col max-w-[45%]">
+                                <span className="text-xs font-bold text-slate-700 truncate" title={sug.from}>{sug.from}</span>
+                                <span className="text-[10px] text-slate-400 font-medium">ended</span>
+                              </div>
+                              <span className="text-slate-400 text-xs font-bold">➡️</span>
+                              <div className="flex flex-col max-w-[45%] text-right">
+                                <span className="text-xs font-bold text-slate-700 truncate" title={sug.to}>{sug.to}</span>
+                                <span className="text-[10px] text-slate-400 font-medium">started</span>
+                              </div>
                             </div>
-                            <span className="text-slate-400 text-xs font-bold">➡️</span>
-                            <div className="flex flex-col max-w-[70%] text-right">
-                              <span className="text-xs font-bold text-slate-700 truncate" title={sug.to}>{sug.to}</span>
-                              <span className="text-[10px] text-slate-400 font-medium">started</span>
+
+                            <div className="flex items-center justify-between pt-2 border-t border-slate-100 text-[11px] text-slate-500">
+                              <span>Gap: <strong>{Math.round(sug.timeGapMs / 100) / 10}s</strong></span>
+                              <span>Distance: <strong>{Math.round(sug.distance)}px</strong></span>
+                            </div>
+
+                            {/* Actions row */}
+                            <div className="flex items-center gap-2">
+                              {isAlreadyStitched ? (
+                                <div className="flex-1 text-center py-1.5 text-xs text-green-700 font-bold bg-green-100/60 rounded border border-green-200">
+                                  ✓ Tracks Stitched
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={() => handleStitch(sug.from, sug.to)}
+                                  className="flex-1 py-1.5 text-xs text-white bg-indigo-600 hover:bg-indigo-700 font-bold rounded transition-colors"
+                                >
+                                  Stitch Tracks
+                                </button>
+                              )}
+                              {/* Hide/show toggle */}
+                              <button
+                                onClick={() => setHiddenPairs(prev => {
+                                  const next = new Set(prev);
+                                  if (next.has(sug.id)) next.delete(sug.id);
+                                  else next.add(sug.id);
+                                  return next;
+                                })}
+                                className="p-1.5 border border-slate-200 rounded hover:bg-slate-100 transition-colors"
+                                title={isPairHidden ? 'Show pair on map' : 'Hide pair on map'}
+                              >
+                                {isPairHidden ? <EyeOff className="w-3.5 h-3.5 text-slate-400" /> : <Eye className="w-3.5 h-3.5 text-slate-600" />}
+                              </button>
+                              {/* Expand detail toggle */}
+                              <button
+                                onClick={() => setExpandedSuggestion(isExpanded ? null : sug.id)}
+                                className="p-1.5 border border-slate-200 rounded hover:bg-slate-100 transition-colors"
+                                title="View pair details"
+                              >
+                                <Info className="w-3.5 h-3.5 text-slate-500" />
+                              </button>
                             </div>
                           </div>
 
-                          <div className="flex items-center justify-between pt-2 border-t border-slate-100 text-[11px] text-slate-500">
-                            <span>Gap: <strong>{Math.round(sug.timeGapMs / 100) / 10}s</strong></span>
-                            <span>Distance: <strong>{Math.round(sug.distance)}px</strong></span>
-                          </div>
-
-                          {isAlreadyStitched ? (
-                            <div className="w-full text-center py-1.5 text-xs text-green-700 font-bold bg-green-100/60 rounded border border-green-200">
-                              ✓ Tracks Stitched
+                          {/* Expanded detail view */}
+                          {isExpanded && (
+                            <div className="border-t border-slate-100 bg-slate-50 rounded-b-lg p-3 space-y-3 text-[11px]">
+                              {[
+                                { label: 'Track A (ended)', bcid: sug.from, pts: trackAPoints, endPt: sug.fromPt },
+                                { label: 'Track B (started)', bcid: sug.to, pts: trackBPoints, startPt: sug.toPt },
+                              ].map(({ label, bcid, pts, endPt, startPt }) => (
+                                <div key={bcid} className="bg-white border border-slate-200 rounded-md p-2.5 space-y-1">
+                                  <div className="font-bold text-slate-600 mb-1">{label}</div>
+                                  <div className="flex justify-between text-slate-500">
+                                    <span>ID</span>
+                                    <span className="font-mono text-slate-700 truncate max-w-[60%] text-right" title={bcid}>{bcid}</span>
+                                  </div>
+                                  <div className="flex justify-between text-slate-500">
+                                    <span>Points</span>
+                                    <span className="font-semibold text-slate-700">{pts.length}</span>
+                                  </div>
+                                  <div className="flex justify-between text-slate-500">
+                                    <span>First seen</span>
+                                    <span className="text-slate-700">{fmtTs(pts[0]?.timestamp)}</span>
+                                  </div>
+                                  <div className="flex justify-between text-slate-500">
+                                    <span>Last seen</span>
+                                    <span className="text-slate-700">{fmtTs(pts[pts.length - 1]?.timestamp)}</span>
+                                  </div>
+                                  {endPt && (
+                                    <div className="flex justify-between text-slate-500">
+                                      <span>End coords</span>
+                                      <span className="font-mono text-slate-700">{Math.round(endPt.x)}, {Math.round(endPt.y)}</span>
+                                    </div>
+                                  )}
+                                  {startPt && (
+                                    <div className="flex justify-between text-slate-500">
+                                      <span>Start coords</span>
+                                      <span className="font-mono text-slate-700">{Math.round(startPt.x)}, {Math.round(startPt.y)}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                              <div className="bg-white border border-indigo-100 rounded-md p-2.5 space-y-1">
+                                <div className="font-bold text-indigo-600 mb-1">Gap Summary</div>
+                                <div className="flex justify-between text-slate-500">
+                                  <span>Time gap</span>
+                                  <span className="font-semibold text-slate-700">{Math.round(sug.timeGapMs / 100) / 10}s</span>
+                                </div>
+                                <div className="flex justify-between text-slate-500">
+                                  <span>Spatial distance</span>
+                                  <span className="font-semibold text-slate-700">{Math.round(sug.distance)}px</span>
+                                </div>
+                              </div>
                             </div>
-                          ) : (
-                            <button
-                              onClick={() => handleStitch(sug.from, sug.to)}
-                              className="w-full py-1.5 text-xs text-white bg-indigo-600 hover:bg-indigo-700 font-bold rounded transition-colors"
-                            >
-                              Stitch Tracks
-                            </button>
                           )}
                         </div>
                       );
@@ -870,12 +1337,137 @@ export default function App() {
                     {stitchSuggestions.length === 0 && (
                       <div className="text-center py-8 text-sm text-slate-400">
                         <HelpCircle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
-                        No stitchable track pairs detected within 15 seconds and 120 pixels.
+                        No stitchable track pairs detected within {maxTimeGapSec}s and {maxDistPx}px.
                       </div>
                     )}
                   </div>
                 </>
-              )}
+              ) : sidebarTab === 'pattern' ? (
+                <>
+                  {/* Zone & Dwell config */}
+                  <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+                    <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Zone Grid</div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-slate-600 w-28 shrink-0">Columns</label>
+                      <input type="number" min={1} max={20} value={gridCols} onChange={e => setGridCols(Math.max(1, Number(e.target.value)))}
+                        className="w-14 px-2 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-slate-600 w-28 shrink-0">Rows</label>
+                      <input type="number" min={1} max={20} value={gridRows} onChange={e => setGridRows(Math.max(1, Number(e.target.value)))}
+                        className="w-14 px-2 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+                    </div>
+                    <button
+                      onClick={() => setShowZoneOverlay(v => !v)}
+                      className={`w-full py-1.5 text-xs font-bold rounded border transition-colors ${showZoneOverlay ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-200 hover:border-indigo-400'}`}
+                    >
+                      {showZoneOverlay ? '🟣 Hide Zone Heatmap' : '🔲 Show Zone Heatmap'}
+                    </button>
+                  </div>
+
+                  <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+                    <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Dwell Detection</div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-slate-600 w-28 shrink-0">Radius</label>
+                      <input type="number" min={5} max={500} value={dwellRadiusPx} onChange={e => setDwellRadiusPx(Math.max(5, Number(e.target.value)))}
+                        className="w-14 px-2 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+                      <span className="text-xs text-slate-400">px</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-slate-600 w-28 shrink-0">Min Duration</label>
+                      <input type="number" min={1} max={300} value={dwellMinSec} onChange={e => setDwellMinSec(Math.max(1, Number(e.target.value)))}
+                        className="w-14 px-2 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-white" />
+                      <span className="text-xs text-slate-400">sec</span>
+                    </div>
+                  </div>
+
+                  {/* Pattern-scored stitch pairs */}
+                  <div className="mb-2 text-[11px] font-bold text-slate-500 uppercase tracking-wider">Stitch Pairs — Pattern Score</div>
+                  <div className="space-y-2">
+                    {[...stitchSuggestions]
+                      .sort((a, b) => (patternScores[b.id] || 0) - (patternScores[a.id] || 0))
+                      .map(sug => {
+                        const score = patternScores[sug.id] ?? 0;
+                        const zoneA = getZoneId(sug.fromPt.x, sug.fromPt.y);
+                        const zoneB = getZoneId(sug.toPt.x, sug.toPt.y);
+                        const transProb = zoneA === zoneB ? 1 : (transitionMatrix[`${zoneA}->${zoneB}`] || 0);
+                        const dwellsA = dwellSegments[sug.from] || [];
+                        const lastDwell = dwellsA[dwellsA.length - 1];
+                        const hasDwell = lastDwell && Math.hypot(lastDwell.centroid.x - sug.fromPt.x, lastDwell.centroid.y - sug.fromPt.y) < dwellRadiusPx * 1.5;
+                        const scoreColor = score >= 70 ? 'text-emerald-600 bg-emerald-50 border-emerald-200'
+                          : score >= 40 ? 'text-amber-600 bg-amber-50 border-amber-200'
+                          : 'text-slate-500 bg-slate-50 border-slate-200';
+
+                        return (
+                          <div key={sug.id} className="bg-white border border-slate-200 rounded-lg p-3 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <div className="text-xs font-bold text-slate-700 truncate max-w-[60%]" title={`${sug.from} → ${sug.to}`}>
+                                {sug.from} <span className="text-slate-400 font-normal">→</span> {sug.to}
+                              </div>
+                              <span className={`text-xs font-extrabold px-2 py-0.5 rounded border ${scoreColor}`}>
+                                {score}%
+                              </span>
+                            </div>
+
+                            {/* Signal breakdown */}
+                            <div className="space-y-1.5 text-[11px]">
+                              {[
+                                { label: 'Time Gap', value: `${Math.round(sug.timeGapMs / 100) / 10}s`, score: Math.round((1 - sug.timeGapMs / (maxTimeGapSec * 1000)) * 100) },
+                                { label: 'Distance', value: `${Math.round(sug.distance)}px`, score: Math.round((1 - sug.distance / maxDistPx) * 100) },
+                                { label: 'Zone Transition', value: `${zoneA} → ${zoneB}`, score: Math.round(transProb * 100) },
+                                { label: 'Dwell at End', value: hasDwell ? `${Math.round((lastDwell?.durationMs || 0) / 1000)}s dwell` : 'None', score: hasDwell ? 100 : 0 },
+                              ].map(({ label, value, score: s }) => (
+                                <div key={label} className="flex items-center gap-2">
+                                  <span className="text-slate-500 w-28 shrink-0">{label}</span>
+                                  <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                    <div
+                                      className={`h-full rounded-full ${s >= 70 ? 'bg-emerald-400' : s >= 40 ? 'bg-amber-400' : 'bg-slate-300'}`}
+                                      style={{ width: `${Math.max(0, s)}%` }}
+                                    />
+                                  </div>
+                                  <span className="text-slate-400 w-16 text-right shrink-0 truncate" title={value}>{value}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                    {stitchSuggestions.length === 0 && (
+                      <div className="text-center py-8 text-sm text-slate-400">
+                        <HelpCircle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                        No stitch pairs to score. Upload body tracking data.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Dwell summary per BCID */}
+                  {Object.keys(dwellSegments).some(k => dwellSegments[k].length > 0) && (
+                    <div className="mt-4">
+                      <div className="mb-2 text-[11px] font-bold text-slate-500 uppercase tracking-wider">Dwell Behaviour</div>
+                      <div className="space-y-2">
+                        {Object.entries(dwellSegments)
+                          .filter(([, segs]) => segs.length > 0)
+                          .sort((a, b) => b[1].length - a[1].length)
+                          .map(([bcid, segs]) => (
+                            <div key={bcid} className="bg-white border border-slate-200 rounded-lg p-2.5 text-[11px]">
+                              <div className="flex items-center justify-between mb-1.5">
+                                <span className="font-bold text-slate-700 truncate max-w-[60%]" title={bcid}>{bcid}</span>
+                                <span className="text-slate-400">{segs.length} dwell{segs.length > 1 ? 's' : ''}</span>
+                              </div>
+                              {segs.map((seg, idx) => (
+                                <div key={idx} className="flex items-center justify-between text-slate-500 pl-1 border-l-2 border-indigo-200 mb-1">
+                                  <span>Zone {seg.zoneId} · {Math.round(seg.durationMs / 1000)}s</span>
+                                  <span className="text-slate-400">{seg.pointCount} pts</span>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : null}
             </div>
           </aside>
         )}
