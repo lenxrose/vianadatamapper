@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Map as MapIcon, Settings, Eye, EyeOff, Info, CheckCircle2, Search, ZoomIn, ZoomOut, Menu, GitCommit, HelpCircle, RefreshCw } from 'lucide-react';
+import { Upload, Map as MapIcon, Settings, Eye, EyeOff, Info, CheckCircle2, Search, ZoomIn, ZoomOut, Menu, GitCommit, HelpCircle, RefreshCw, Play, Pause, SkipBack } from 'lucide-react';
 import Papa from 'papaparse';
 
 export default function App() {
@@ -40,6 +40,13 @@ export default function App() {
 
   // Legend sort: 'default' | 'points-desc' | 'points-asc' | 'duration-desc' | 'duration-asc'
   const [legendSort, setLegendSort] = useState('points-desc');
+
+  // Journey animation
+  const [isAnimating, setIsAnimating] = useState(false);
+  const [animProgress, setAnimProgress] = useState(0); // 0–1
+  const [animSpeed, setAnimSpeed] = useState(1); // playback multiplier
+  const animRafRef = useRef(null);
+  const animLastTimeRef = useRef(null);
 
   // Pattern analysis
   const [gridCols, setGridCols] = useState(6);
@@ -538,6 +545,33 @@ export default function App() {
     return stats;
   }, [activeData, merges]);
 
+  // Animation RAF loop
+  useEffect(() => {
+    if (!isAnimating) {
+      cancelAnimationFrame(animRafRef.current);
+      animLastTimeRef.current = null;
+      return;
+    }
+    const totalWallMs = 20000 / animSpeed; // full journey = 20s at 1×
+    const tick = (now) => {
+      if (animLastTimeRef.current === null) animLastTimeRef.current = now;
+      const elapsed = now - animLastTimeRef.current;
+      animLastTimeRef.current = now;
+      const delta = elapsed / totalWallMs;
+      setAnimProgress(prev => {
+        const next = prev + delta;
+        if (next >= 1) {
+          setIsAnimating(false);
+          return 1;
+        }
+        return next;
+      });
+      animRafRef.current = requestAnimationFrame(tick);
+    };
+    animRafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animRafRef.current);
+  }, [isAnimating, animSpeed]);
+
   const processData = () => {
     if (!imageSrc || (csvData.body.length === 0 && csvData.touches.length === 0)) {
       alert("Please upload both the floor plan image and the CSV data.");
@@ -553,6 +587,13 @@ export default function App() {
       y: scaleCoordinates ? d.rawY * resolution.height : d.rawY
     }));
   }, [activeData, scaleCoordinates, resolution]);
+
+  // Global time range across all active display data (must come after displayData)
+  const timeRange = useMemo(() => {
+    const timestamps = displayData.map(d => d.timestamp).filter(t => t && !isNaN(t));
+    if (timestamps.length === 0) return null;
+    return { min: Math.min(...timestamps), max: Math.max(...timestamps) };
+  }, [displayData]);
 
   // Handle manual stitch action
   const handleStitch = (from, to) => {
@@ -644,6 +685,12 @@ export default function App() {
       }
     });
 
+    // Compute animation time cursor
+    const isAnimMode = animProgress > 0 && animProgress <= 1 && timeRange;
+    const currentMaxTs = isAnimMode
+      ? timeRange.min + animProgress * (timeRange.max - timeRange.min)
+      : null;
+
     // 3. Render the paths
     Object.entries(groupedData).forEach(([repBcid, points]) => {
       if (hiddenBcids.has(repBcid)) return;
@@ -652,8 +699,15 @@ export default function App() {
 
       const color = bcidColors[repBcid] || '#ccc';
 
+      // In animation mode, only show points up to currentMaxTs
+      const visiblePoints = currentMaxTs
+        ? points.filter(p => p.timestamp <= currentMaxTs)
+        : points;
+
+      if (visiblePoints.length === 0) return;
+
       if (renderMode === 'dots') {
-        points.forEach(point => {
+        visiblePoints.forEach(point => {
           const isTouch = point.type === 'touch';
 
           ctx.beginPath();
@@ -673,7 +727,7 @@ export default function App() {
         });
       } else {
         // Sort entire merged group chronologically to connect them smoothly
-        const sortedPoints = [...points].sort((a, b) => {
+        const sortedPoints = [...visiblePoints].sort((a, b) => {
           if (a.timestamp && b.timestamp) return a.timestamp - b.timestamp;
           return a.rowIndex - b.rowIndex;
         });
@@ -745,17 +799,41 @@ export default function App() {
           ctx.strokeStyle = '#fff';
           ctx.stroke();
 
-          ctx.beginPath();
-          ctx.arc(endPt.x, endPt.y, 5, 0, 2*Math.PI);
-          ctx.fillStyle = '#ef4444';
-          ctx.fill();
-          ctx.lineWidth = 1.5;
-          ctx.strokeStyle = '#fff';
-          ctx.stroke();
+          if (!isAnimMode) {
+            ctx.beginPath();
+            ctx.arc(endPt.x, endPt.y, 5, 0, 2*Math.PI);
+            ctx.fillStyle = '#ef4444';
+            ctx.fill();
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = '#fff';
+            ctx.stroke();
+          }
         }
       }
+
+      // Animated head: glowing dot at the leading edge
+      if (isAnimMode && visiblePoints.length > 0) {
+        const sorted = [...visiblePoints].sort((a, b) => a.timestamp - b.timestamp);
+        const head = sorted[sorted.length - 1];
+        // outer glow
+        const gradient = ctx.createRadialGradient(head.x, head.y, 4, head.x, head.y, 18);
+        gradient.addColorStop(0, color.replace('hsl(', 'hsla(').replace(')', ', 0.5)'));
+        gradient.addColorStop(1, color.replace('hsl(', 'hsla(').replace(')', ', 0)'));
+        ctx.beginPath();
+        ctx.arc(head.x, head.y, 18, 0, 2 * Math.PI);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+        // solid head
+        ctx.beginPath();
+        ctx.arc(head.x, head.y, 7, 0, 2 * Math.PI);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+      }
     });
-  }, [appState, displayData, hiddenBcids, hiddenPairs, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion, stitchSuggestions, showZoneOverlay, zoneDensity, gridCols, gridRows]);
+  }, [appState, displayData, hiddenBcids, hiddenPairs, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion, stitchSuggestions, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange]);
 
   // Handle Mouse Hover for Tooltips
   const handleMouseMove = (e) => {
@@ -938,6 +1016,63 @@ export default function App() {
       </header>
 
       <div className="flex flex-1 overflow-hidden relative">
+
+        {/* Journey Animation Controls */}
+        {appState === 'map' && timeRange && (
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2 w-[min(560px,80%)]">
+            {/* Scrubber + timestamp */}
+            <div className="w-full flex items-center gap-2 bg-white/90 backdrop-blur rounded-xl px-4 py-2 shadow-lg border border-slate-200">
+              <span className="text-[10px] font-mono text-slate-400 shrink-0 w-16 text-right">
+                {timeRange ? new Date(timeRange.min + animProgress * (timeRange.max - timeRange.min)).toLocaleTimeString() : '--:--'}
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={1000}
+                value={Math.round(animProgress * 1000)}
+                onChange={e => {
+                  setIsAnimating(false);
+                  setAnimProgress(Number(e.target.value) / 1000);
+                }}
+                className="flex-1 h-1.5 accent-indigo-600 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-slate-400 shrink-0 w-16">
+                {timeRange ? new Date(timeRange.max).toLocaleTimeString() : '--:--'}
+              </span>
+            </div>
+            {/* Play controls */}
+            <div className="flex items-center gap-2 bg-white/90 backdrop-blur rounded-xl px-4 py-2 shadow-lg border border-slate-200">
+              <button
+                onClick={() => { setAnimProgress(0); setIsAnimating(false); animLastTimeRef.current = null; }}
+                className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-600 transition-colors"
+                title="Reset"
+              >
+                <SkipBack className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => {
+                  if (animProgress >= 1) { setAnimProgress(0); animLastTimeRef.current = null; }
+                  setIsAnimating(v => !v);
+                }}
+                className="flex items-center gap-1.5 px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm"
+              >
+                {isAnimating ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                {isAnimating ? 'Pause' : animProgress > 0 && animProgress < 1 ? 'Resume' : 'Play Journey'}
+              </button>
+              <div className="h-5 border-l border-slate-200 mx-1" />
+              <span className="text-[11px] text-slate-500 font-medium">Speed:</span>
+              {[1, 2, 5, 10].map(s => (
+                <button
+                  key={s}
+                  onClick={() => setAnimSpeed(s)}
+                  className={`px-2 py-1 text-[11px] font-bold rounded transition-colors border ${animSpeed === s ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-400'}`}
+                >
+                  {s}×
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Floating Zoom Controls */}
         <div className="absolute bottom-6 left-6 flex flex-col bg-white rounded-lg shadow-md border border-slate-200 overflow-hidden z-20">
