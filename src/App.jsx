@@ -553,7 +553,7 @@ export default function App() {
       animLastTimeRef.current = null;
       return;
     }
-    const totalWallMs = 20000 / animSpeed; // full journey = 20s at 1×
+    const totalWallMs = 60000 / animSpeed; // full journey = 60s at 1×
     const tick = (now) => {
       if (animLastTimeRef.current === null) animLastTimeRef.current = now;
       const elapsed = now - animLastTimeRef.current;
