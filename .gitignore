@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local test fixtures (large sample data, not part of the app)
+/public
+test-results
+playwright-report

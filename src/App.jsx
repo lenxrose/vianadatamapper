@@ -526,8 +526,12 @@ export default function App() {
         const mins = Math.floor(diffSec / 60);
         const secs = diffSec % 60;
         s.durationStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+        s.startStr = new Date(s.minTs).toLocaleTimeString();
+        s.endStr = new Date(s.maxTs).toLocaleTimeString();
       } else {
         s.durationStr = 'N/A';
+        s.startStr = 'N/A';
+        s.endStr = 'N/A';
       }
     });
 
@@ -1147,8 +1151,13 @@ export default function App() {
                               {isHidden ? <EyeOff className="w-4 h-4 text-slate-400" /> : <Eye className="w-4 h-4 text-slate-600" />}
                             </div>
                           </div>
+                          <div className="mt-1.5 pl-7 flex items-center gap-1 text-[10px] text-slate-400 font-medium">
+                            <span>{stats.startStr}</span>
+                            <span className="text-slate-300">→</span>
+                            <span>{stats.endStr}</span>
+                          </div>
                           {stats.mergedChildren.length > 0 && (
-                            <div className="mt-1.5 pl-7 text-[10px] text-slate-400 font-medium">
+                            <div className="mt-1 pl-7 text-[10px] text-slate-400 font-medium">
                               Stitched with: {stats.mergedChildren.join(', ')}
                             </div>
                           )}

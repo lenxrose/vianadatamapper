@@ -9,7 +9,16 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git remote *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(npm i *)",
+      "Bash(sudo npm i -g vercel)",
+      "Bash(node --input-type=module)",
+      "Bash(npx vite *)",
+      "Bash(curl -s http://localhost:5173)",
+      "Bash(open http://localhost:5173)",
+      "Bash(gh pr create --title 'Add pattern analysis, stitch detail view, large CSV streaming, and BCID sorting' --body ' *)",
+      "Bash(gh api *)",
+      "Bash(npx playwright *)"
     ]
   }
 }
