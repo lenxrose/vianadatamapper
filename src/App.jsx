@@ -53,6 +53,7 @@ export default function App() {
   const [gridRows, setGridRows] = useState(4);
   const [dwellRadiusPx, setDwellRadiusPx] = useState(50);
   const [dwellMinSec, setDwellMinSec] = useState(5);
+  const [selectedZones, setSelectedZones] = useState(new Set()); // empty = show all
   const [showZoneOverlay, setShowZoneOverlay] = useState(false);
 
   // Helper to trace up the merge tree to find the ultimate parent track representative
@@ -700,9 +701,12 @@ export default function App() {
       const color = bcidColors[repBcid] || '#ccc';
 
       // In animation mode, only show points up to currentMaxTs
-      const visiblePoints = currentMaxTs
-        ? points.filter(p => p.timestamp <= currentMaxTs)
-        : points;
+      // Also filter by selected zones if any are active
+      const visiblePoints = points.filter(p => {
+        if (currentMaxTs && p.timestamp > currentMaxTs) return false;
+        if (selectedZones.size > 0 && !selectedZones.has(getZoneId(p.x, p.y))) return false;
+        return true;
+      });
 
       if (visiblePoints.length === 0) return;
 
@@ -833,7 +837,7 @@ export default function App() {
         ctx.stroke();
       }
     });
-  }, [appState, displayData, hiddenBcids, hiddenPairs, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion, stitchSuggestions, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange]);
+  }, [appState, displayData, hiddenBcids, hiddenPairs, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion, stitchSuggestions, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones]);
 
   // Handle Mouse Hover for Tooltips
   const handleMouseMove = (e) => {
@@ -997,7 +1001,7 @@ export default function App() {
           </div>
 
           <button
-            onClick={() => setAppState('setup')}
+            onClick={() => { setAppState('setup'); setSelectedZones(new Set()); }}
             className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors font-medium ml-2"
           >
             Start Over
@@ -1488,6 +1492,70 @@ export default function App() {
                 </>
               ) : sidebarTab === 'pattern' ? (
                 <>
+                  {/* Zone Filter */}
+                  <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Filter by Zone</div>
+                      {selectedZones.size > 0 && (
+                        <button
+                          onClick={() => setSelectedZones(new Set())}
+                          className="text-[10px] text-indigo-600 hover:text-indigo-800 font-semibold"
+                        >
+                          Show All
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-400 leading-snug">
+                      Click zones to filter detections. Multi-select supported.
+                    </p>
+                    {/* Zone picker grid */}
+                    <div
+                      className="w-full border border-slate-200 rounded overflow-hidden"
+                      style={{ display: 'grid', gridTemplateColumns: `repeat(${gridCols}, 1fr)`, aspectRatio: `${resolution.width} / ${resolution.height}` }}
+                    >
+                      {Array.from({ length: gridRows }, (_, r) =>
+                        Array.from({ length: gridCols }, (_, c) => {
+                          const zid = `${c}:${r}`;
+                          const count = zoneDensity[zid] || 0;
+                          const maxD = Math.max(1, ...Object.values(zoneDensity));
+                          const intensity = count / maxD;
+                          const isSelected = selectedZones.has(zid);
+                          return (
+                            <button
+                              key={zid}
+                              onClick={() => setSelectedZones(prev => {
+                                const next = new Set(prev);
+                                if (next.has(zid)) next.delete(zid);
+                                else next.add(zid);
+                                return next;
+                              })}
+                              title={`Zone ${zid}: ${count} detections`}
+                              style={{
+                                backgroundColor: isSelected
+                                  ? `rgba(99,102,241,${0.3 + intensity * 0.55})`
+                                  : count > 0
+                                    ? `rgba(99,102,241,${0.08 + intensity * 0.25})`
+                                    : 'rgba(226,232,240,0.4)',
+                              }}
+                              className={`relative border border-slate-200/60 transition-all text-[8px] font-bold flex items-center justify-center
+                                ${isSelected ? 'ring-2 ring-inset ring-indigo-500 text-indigo-900' : count > 0 ? 'text-slate-500 hover:ring-1 hover:ring-indigo-400' : 'text-slate-300 hover:ring-1 hover:ring-slate-300'}`}
+                            >
+                              {count > 0 ? count : ''}
+                              {isSelected && (
+                                <span className="absolute inset-0 flex items-center justify-center text-indigo-700 text-[9px] font-extrabold">✓</span>
+                              )}
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                    {selectedZones.size > 0 && (
+                      <div className="text-[10px] text-indigo-600 font-semibold">
+                        {selectedZones.size} zone{selectedZones.size > 1 ? 's' : ''} selected — showing filtered detections
+                      </div>
+                    )}
+                  </div>
+
                   {/* Zone & Dwell config */}
                   <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
                     <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Zone Grid</div>
