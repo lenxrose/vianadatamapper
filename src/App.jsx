@@ -116,9 +116,11 @@ export default function App() {
 
     const eventTsIdx = headers.indexOf('event_ts');
     const outputsIdx = headers.indexOf('outputs');
-    // flat fallback columns (single-output rows)
+    // flat fallback columns (single-output rows) — support both old and new schema
     const bcidIdx    = headers.indexOf('bcid');
-    const floorPtIdx = headers.indexOf('floor_pt_fused');
+    const floorPtIdx = headers.indexOf('floor_pt_fused') !== -1
+      ? headers.indexOf('floor_pt_fused')
+      : headers.indexOf('floor_pt');
     const touchesIdx = headers.indexOf('touches');
 
     console.log('[CSV] outputsIdx:', outputsIdx, 'bcidIdx:', bcidIdx, 'floorPtIdx:', floorPtIdx);
@@ -250,7 +252,9 @@ export default function App() {
             eventTsIdx  = headers.indexOf('event_ts');
             outputsIdx  = headers.indexOf('outputs');
             bcidIdx     = headers.indexOf('bcid');
-            floorPtIdx  = headers.indexOf('floor_pt_fused');
+            floorPtIdx  = headers.indexOf('floor_pt_fused') !== -1
+              ? headers.indexOf('floor_pt_fused')
+              : headers.indexOf('floor_pt');
             touchesIdx  = headers.indexOf('touches');
             console.log('[CSV] outputsIdx:', outputsIdx, 'bcidIdx:', bcidIdx, 'floorPtIdx:', floorPtIdx);
             continue;
