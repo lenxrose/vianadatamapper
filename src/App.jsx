@@ -326,7 +326,8 @@ export default function App() {
         const colors = {};
         const allUniqueBcids = [...new Set([...bodyPoints.map(d => d.bcid), ...touchPoints.map(d => d.bcid)])];
         allUniqueBcids.forEach((id, index) => {
-          colors[id] = `hsl(${Math.floor((index / allUniqueBcids.length) * 360)}, 75%, 75%)`;
+          // Golden-angle distribution: consecutive BCIDs get maximally distinct hues
+          colors[id] = `hsl(${Math.round((index * 137.508) % 360)}, 78%, 62%)`;
         });
         setScaleCoordinates(isNormalized);
         setBcidColors(colors);
@@ -593,6 +594,34 @@ export default function App() {
     }));
   }, [activeData, scaleCoordinates, resolution]);
 
+  // Pre-compute sorted groups once (not inside the 60fps canvas loop)
+  const sortedGroupedData = useMemo(() => {
+    const grouped = {};
+    displayData.forEach(point => {
+      const repBcid = getMergedRepresentative(point.bcid, merges);
+      if (!grouped[repBcid]) grouped[repBcid] = [];
+      grouped[repBcid].push(point);
+    });
+    Object.keys(grouped).forEach(key => {
+      grouped[key].sort((a, b) =>
+        (a.timestamp || a.rowIndex) - (b.timestamp || b.rowIndex)
+      );
+    });
+    return grouped;
+  }, [displayData, merges]);
+
+  // Pre-compute pair-hidden set (not inside the 60fps canvas loop)
+  const pairHiddenBcids = useMemo(() => {
+    const set = new Set();
+    stitchSuggestions.forEach(sug => {
+      if (hiddenPairs.has(sug.id)) {
+        set.add(getMergedRepresentative(sug.from, merges));
+        set.add(getMergedRepresentative(sug.to, merges));
+      }
+    });
+    return set;
+  }, [stitchSuggestions, hiddenPairs, merges]);
+
   // Global time range across all active display data (must come after displayData)
   const timeRange = useMemo(() => {
     const timestamps = displayData.map(d => d.timestamp).filter(t => t && !isNaN(t));
@@ -609,6 +638,19 @@ export default function App() {
       if (repFrom !== repTo) {
         next[repTo] = repFrom;
       }
+      return next;
+    });
+  };
+
+  // Stitch all suggested pairs at once
+  const handleStitchAll = () => {
+    setMerges(prev => {
+      const next = { ...prev };
+      stitchSuggestions.forEach(sug => {
+        const repFrom = getMergedRepresentative(sug.from, next);
+        const repTo   = getMergedRepresentative(sug.to, next);
+        if (repFrom !== repTo) next[repTo] = repFrom;
+      });
       return next;
     });
   };
@@ -673,51 +715,37 @@ export default function App() {
       ctx.fill();
     }
 
-    // 2. Group active data by ultimate merged parent BCID
-    const groupedData = {};
-    displayData.forEach(point => {
-      const repBcid = getMergedRepresentative(point.bcid, merges);
-      if (!groupedData[repBcid]) groupedData[repBcid] = [];
-      groupedData[repBcid].push(point);
-    });
-
-    // BCIDs hidden via pair toggles
-    const pairHiddenBcids = new Set();
-    stitchSuggestions.forEach(sug => {
-      if (hiddenPairs.has(sug.id)) {
-        pairHiddenBcids.add(getMergedRepresentative(sug.from, merges));
-        pairHiddenBcids.add(getMergedRepresentative(sug.to, merges));
-      }
-    });
-
     // Compute animation time cursor
     const isAnimMode = animProgress > 0 && animProgress <= 1 && timeRange;
     const currentMaxTs = isAnimMode
       ? timeRange.min + animProgress * (timeRange.max - timeRange.min)
       : null;
 
+    // 2. Use pre-computed sorted groups (avoids re-sort every animation frame)
     // 3. Render the paths
-    Object.entries(groupedData).forEach(([repBcid, points]) => {
+    Object.entries(sortedGroupedData).forEach(([repBcid, sortedPoints]) => {
       if (hiddenBcids.has(repBcid)) return;
       if (pairHiddenBcids.has(repBcid)) return;
       if (searchQuery && !repBcid.toLowerCase().includes(searchQuery.toLowerCase())) return;
 
       const color = bcidColors[repBcid] || '#ccc';
 
-      // In animation mode, only show points up to currentMaxTs
+      // In animation mode, slice to points up to currentMaxTs (array is pre-sorted)
       // Also filter by selected zones if any are active
-      const visiblePoints = points.filter(p => {
-        if (currentMaxTs && p.timestamp > currentMaxTs) return false;
-        if (selectedZones.size > 0 && !selectedZones.has(getZoneId(p.x, p.y))) return false;
-        return true;
-      });
+      let visiblePoints = sortedPoints;
+      if (currentMaxTs || selectedZones.size > 0) {
+        visiblePoints = sortedPoints.filter(p => {
+          if (currentMaxTs && p.timestamp > currentMaxTs) return false;
+          if (selectedZones.size > 0 && !selectedZones.has(getZoneId(p.x, p.y))) return false;
+          return true;
+        });
+      }
 
       if (visiblePoints.length === 0) return;
 
       if (renderMode === 'dots') {
         visiblePoints.forEach(point => {
           const isTouch = point.type === 'touch';
-
           ctx.beginPath();
           ctx.arc(point.x, point.y, isTouch ? 9 : 4, 0, 2 * Math.PI);
           ctx.fillStyle = color;
@@ -725,7 +753,6 @@ export default function App() {
           ctx.lineWidth = 1;
           ctx.strokeStyle = 'rgba(0,0,0,0.6)';
           ctx.stroke();
-
           if (isTouch) {
             ctx.font = '12px Arial';
             ctx.textAlign = 'center';
@@ -734,18 +761,13 @@ export default function App() {
           }
         });
       } else {
-        // Sort entire merged group chronologically to connect them smoothly
-        const sortedPoints = [...visiblePoints].sort((a, b) => {
-          if (a.timestamp && b.timestamp) return a.timestamp - b.timestamp;
-          return a.rowIndex - b.rowIndex;
-        });
-
-        if (sortedPoints.length === 0) return;
+        // Already sorted — no re-sort needed
+        if (visiblePoints.length === 0) return;
 
         ctx.beginPath();
-        ctx.moveTo(sortedPoints[0].x, sortedPoints[0].y);
-        for(let i = 1; i < sortedPoints.length; i++) {
-          ctx.lineTo(sortedPoints[i].x, sortedPoints[i].y);
+        ctx.moveTo(visiblePoints[0].x, visiblePoints[0].y);
+        for (let i = 1; i < visiblePoints.length; i++) {
+          ctx.lineTo(visiblePoints[i].x, visiblePoints[i].y);
         }
         ctx.strokeStyle = color;
         ctx.lineWidth = 3;
@@ -755,15 +777,14 @@ export default function App() {
 
         if (renderMode === 'arrows') {
           let accumulatedDist = 0;
-          for(let i = 0; i < sortedPoints.length - 1; i++) {
-            const p1 = sortedPoints[i];
-            const p2 = sortedPoints[i+1];
+          for (let i = 0; i < visiblePoints.length - 1; i++) {
+            const p1 = visiblePoints[i];
+            const p2 = visiblePoints[i + 1];
             const dx = p2.x - p1.x;
             const dy = p2.y - p1.y;
-            const dist = Math.sqrt(dx*dx + dy*dy);
+            const dist = Math.sqrt(dx * dx + dy * dy);
             accumulatedDist += dist;
-
-            if (accumulatedDist > 60 || i === sortedPoints.length - 2) {
+            if (accumulatedDist > 60 || i === visiblePoints.length - 2) {
               const angle = Math.atan2(dy, dx);
               ctx.save();
               ctx.beginPath();
@@ -784,8 +805,8 @@ export default function App() {
           }
         }
 
-        // Embellish touch points
-        sortedPoints.forEach(point => {
+        // Touch embellishments
+        visiblePoints.forEach(point => {
           if (point.type === 'touch') {
             ctx.font = '14px Arial';
             ctx.textAlign = 'center';
@@ -794,13 +815,11 @@ export default function App() {
           }
         });
 
-        // Embellish start/end points
-        if (sortedPoints.length > 1 && dataSource !== 'touches') {
-          const startPt = sortedPoints[0];
-          const endPt = sortedPoints[sortedPoints.length - 1];
-
+        // Start/end markers
+        if (visiblePoints.length > 1 && dataSource !== 'touches') {
+          const startPt = visiblePoints[0];
           ctx.beginPath();
-          ctx.arc(startPt.x, startPt.y, 5, 0, 2*Math.PI);
+          ctx.arc(startPt.x, startPt.y, 5, 0, 2 * Math.PI);
           ctx.fillStyle = '#10b981';
           ctx.fill();
           ctx.lineWidth = 1.5;
@@ -808,8 +827,9 @@ export default function App() {
           ctx.stroke();
 
           if (!isAnimMode) {
+            const endPt = visiblePoints[visiblePoints.length - 1];
             ctx.beginPath();
-            ctx.arc(endPt.x, endPt.y, 5, 0, 2*Math.PI);
+            ctx.arc(endPt.x, endPt.y, 5, 0, 2 * Math.PI);
             ctx.fillStyle = '#ef4444';
             ctx.fill();
             ctx.lineWidth = 1.5;
@@ -819,10 +839,9 @@ export default function App() {
         }
       }
 
-      // Animated head: glowing dot at the leading edge
+      // Animated head: glowing dot + BCID label at the leading edge
       if (isAnimMode && visiblePoints.length > 0) {
-        const sorted = [...visiblePoints].sort((a, b) => a.timestamp - b.timestamp);
-        const head = sorted[sorted.length - 1];
+        const head = visiblePoints[visiblePoints.length - 1];
         // outer glow
         const gradient = ctx.createRadialGradient(head.x, head.y, 4, head.x, head.y, 18);
         gradient.addColorStop(0, color.replace('hsl(', 'hsla(').replace(')', ', 0.5)'));
@@ -839,9 +858,23 @@ export default function App() {
         ctx.lineWidth = 2;
         ctx.strokeStyle = '#fff';
         ctx.stroke();
+        // BCID label above the head
+        const label = repBcid.length > 12 ? repBcid.slice(-10) : repBcid;
+        const labelX = head.x;
+        const labelY = head.y - 24;
+        ctx.font = 'bold 11px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        const textW = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        ctx.beginPath();
+        ctx.roundRect(labelX - textW / 2 - 4, labelY - 14, textW + 8, 16, 3);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, labelX, labelY);
       }
     });
-  }, [appState, displayData, hiddenBcids, hiddenPairs, bcidColors, searchQuery, renderMode, dataSource, merges, hoveredSuggestion, stitchSuggestions, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones]);
+  }, [appState, sortedGroupedData, pairHiddenBcids, hiddenBcids, bcidColors, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones]);
 
   // Handle Mouse Hover for Tooltips
   const handleMouseMove = (e) => {
@@ -1325,6 +1358,17 @@ export default function App() {
                       Scans coordinates and event timestamps to identify separate track segments that ended and started close in time and space.
                     </p>
                   </div>
+
+                  {/* Stitch All */}
+                  {stitchSuggestions.length > 0 && (
+                    <button
+                      onClick={handleStitchAll}
+                      className="w-full mb-3 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-1.5"
+                    >
+                      <GitCommit className="w-3.5 h-3.5" />
+                      Stitch All {stitchSuggestions.length} Pairs
+                    </button>
+                  )}
 
                   {/* Configurable thresholds */}
                   <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
