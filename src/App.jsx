@@ -594,7 +594,7 @@ export default function App() {
     }));
   }, [activeData, scaleCoordinates, resolution]);
 
-  // Pre-compute sorted groups once (not inside the 60fps canvas loop)
+  // Pre-compute sorted + smoothed groups once (not inside the 60fps canvas loop)
   const sortedGroupedData = useMemo(() => {
     const grouped = {};
     displayData.forEach(point => {
@@ -602,10 +602,19 @@ export default function App() {
       if (!grouped[repBcid]) grouped[repBcid] = [];
       grouped[repBcid].push(point);
     });
+    const HALF = 3; // sliding window half-width → window of 7 points
     Object.keys(grouped).forEach(key => {
-      grouped[key].sort((a, b) =>
-        (a.timestamp || a.rowIndex) - (b.timestamp || b.rowIndex)
-      );
+      const arr = grouped[key];
+      arr.sort((a, b) => (a.timestamp || a.rowIndex) - (b.timestamp || b.rowIndex));
+      // Compute smoothed sx/sy via sliding average, keep raw x/y for zone checks
+      grouped[key] = arr.map((pt, i) => {
+        const lo = Math.max(0, i - HALF);
+        const hi = Math.min(arr.length - 1, i + HALF);
+        let sx = 0, sy = 0;
+        for (let j = lo; j <= hi; j++) { sx += arr[j].x; sy += arr[j].y; }
+        const count = hi - lo + 1;
+        return { ...pt, sx: sx / count, sy: sy / count };
+      });
     });
     return grouped;
   }, [displayData, merges]);
@@ -743,11 +752,15 @@ export default function App() {
 
       if (visiblePoints.length === 0) return;
 
+      // Helper: use smoothed coords for drawing, raw coords for zone checks
+      const dx = p => p.sx ?? p.x;
+      const dy = p => p.sy ?? p.y;
+
       if (renderMode === 'dots') {
         visiblePoints.forEach(point => {
           const isTouch = point.type === 'touch';
           ctx.beginPath();
-          ctx.arc(point.x, point.y, isTouch ? 9 : 4, 0, 2 * Math.PI);
+          ctx.arc(dx(point), dy(point), isTouch ? 9 : 4, 0, 2 * Math.PI);
           ctx.fillStyle = color;
           ctx.fill();
           ctx.lineWidth = 1;
@@ -757,17 +770,16 @@ export default function App() {
             ctx.font = '12px Arial';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.fillText('🖐️', point.x, point.y);
+            ctx.fillText('🖐️', dx(point), dy(point));
           }
         });
       } else {
-        // Already sorted — no re-sort needed
         if (visiblePoints.length === 0) return;
 
         ctx.beginPath();
-        ctx.moveTo(visiblePoints[0].x, visiblePoints[0].y);
+        ctx.moveTo(dx(visiblePoints[0]), dy(visiblePoints[0]));
         for (let i = 1; i < visiblePoints.length; i++) {
-          ctx.lineTo(visiblePoints[i].x, visiblePoints[i].y);
+          ctx.lineTo(dx(visiblePoints[i]), dy(visiblePoints[i]));
         }
         ctx.strokeStyle = color;
         ctx.lineWidth = 3;
@@ -780,15 +792,15 @@ export default function App() {
           for (let i = 0; i < visiblePoints.length - 1; i++) {
             const p1 = visiblePoints[i];
             const p2 = visiblePoints[i + 1];
-            const dx = p2.x - p1.x;
-            const dy = p2.y - p1.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
+            const adx = dx(p2) - dx(p1);
+            const ady = dy(p2) - dy(p1);
+            const dist = Math.sqrt(adx * adx + ady * ady);
             accumulatedDist += dist;
             if (accumulatedDist > 60 || i === visiblePoints.length - 2) {
-              const angle = Math.atan2(dy, dx);
+              const angle = Math.atan2(ady, adx);
               ctx.save();
               ctx.beginPath();
-              ctx.translate(p2.x, p2.y);
+              ctx.translate(dx(p2), dy(p2));
               ctx.rotate(angle);
               ctx.moveTo(2, 0);
               ctx.lineTo(-10, -6);
@@ -811,7 +823,7 @@ export default function App() {
             ctx.font = '14px Arial';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.fillText('🖐️', point.x, point.y);
+            ctx.fillText('🖐️', dx(point), dy(point));
           }
         });
 
@@ -819,7 +831,7 @@ export default function App() {
         if (visiblePoints.length > 1 && dataSource !== 'touches') {
           const startPt = visiblePoints[0];
           ctx.beginPath();
-          ctx.arc(startPt.x, startPt.y, 5, 0, 2 * Math.PI);
+          ctx.arc(dx(startPt), dy(startPt), 5, 0, 2 * Math.PI);
           ctx.fillStyle = '#10b981';
           ctx.fill();
           ctx.lineWidth = 1.5;
@@ -829,7 +841,7 @@ export default function App() {
           if (!isAnimMode) {
             const endPt = visiblePoints[visiblePoints.length - 1];
             ctx.beginPath();
-            ctx.arc(endPt.x, endPt.y, 5, 0, 2 * Math.PI);
+            ctx.arc(dx(endPt), dy(endPt), 5, 0, 2 * Math.PI);
             ctx.fillStyle = '#ef4444';
             ctx.fill();
             ctx.lineWidth = 1.5;
@@ -839,29 +851,46 @@ export default function App() {
         }
       }
 
-      // Animated head: glowing dot + BCID label at the leading edge
+      // Animated head: interpolated position between last visible and next point
       if (isAnimMode && visiblePoints.length > 0) {
-        const head = visiblePoints[visiblePoints.length - 1];
-        // outer glow
-        const gradient = ctx.createRadialGradient(head.x, head.y, 4, head.x, head.y, 18);
+        const allSorted = sortedGroupedData[repBcid];
+        const lastVisible = visiblePoints[visiblePoints.length - 1];
+        const nextIdx = allSorted.findIndex(p => p.timestamp > currentMaxTs);
+        let hx = dx(lastVisible);
+        let hy = dy(lastVisible);
+
+        // Lerp toward next detection for smooth gliding
+        if (nextIdx > 0 && nextIdx < allSorted.length) {
+          const prev = allSorted[nextIdx - 1];
+          const next = allSorted[nextIdx];
+          const span = next.timestamp - prev.timestamp;
+          if (span > 0) {
+            const t = Math.max(0, Math.min(1, (currentMaxTs - prev.timestamp) / span));
+            hx = dx(prev) + t * (dx(next) - dx(prev));
+            hy = dy(prev) + t * (dy(next) - dy(prev));
+          }
+        }
+
+        // Outer glow
+        const gradient = ctx.createRadialGradient(hx, hy, 4, hx, hy, 18);
         gradient.addColorStop(0, color.replace('hsl(', 'hsla(').replace(')', ', 0.5)'));
         gradient.addColorStop(1, color.replace('hsl(', 'hsla(').replace(')', ', 0)'));
         ctx.beginPath();
-        ctx.arc(head.x, head.y, 18, 0, 2 * Math.PI);
+        ctx.arc(hx, hy, 18, 0, 2 * Math.PI);
         ctx.fillStyle = gradient;
         ctx.fill();
-        // solid head
+        // Solid head
         ctx.beginPath();
-        ctx.arc(head.x, head.y, 7, 0, 2 * Math.PI);
+        ctx.arc(hx, hy, 7, 0, 2 * Math.PI);
         ctx.fillStyle = color;
         ctx.fill();
         ctx.lineWidth = 2;
         ctx.strokeStyle = '#fff';
         ctx.stroke();
-        // BCID label above the head
+        // BCID label
         const label = repBcid.length > 12 ? repBcid.slice(-10) : repBcid;
-        const labelX = head.x;
-        const labelY = head.y - 24;
+        const labelX = hx;
+        const labelY = hy - 24;
         ctx.font = 'bold 11px Arial';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
