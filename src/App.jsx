@@ -41,6 +41,12 @@ export default function App() {
   // Legend sort: 'default' | 'points-desc' | 'points-asc' | 'duration-desc' | 'duration-asc'
   const [legendSort, setLegendSort] = useState('points-desc');
 
+  // Click-to-focus: highlight one path, dim everything else
+  const [focusedBcid, setFocusedBcid] = useState(null);
+
+  // Show/hide gap bridges on the canvas
+  const [showGapBridges, setShowGapBridges] = useState(true);
+
   // Journey animation
   const [isAnimating, setIsAnimating] = useState(false);
   const [animProgress, setAnimProgress] = useState(0); // 0–1
@@ -384,12 +390,14 @@ export default function App() {
 
           const dist = Math.hypot(bx - ax, by - ay);
           if (dist <= maxDistPixels) {
+            const speedPxPerSec = timeGap > 0 ? dist / (timeGap / 1000) : 0;
             suggestions.push({
               id: `${trackA.bcid}-${trackB.bcid}`,
               from: trackA.bcid,
               to: trackB.bcid,
               timeGapMs: timeGap,
               distance: dist,
+              speedPxPerSec,
               fromPt: { x: ax, y: ay },
               toPt: { x: bx, y: by }
             });
@@ -631,6 +639,42 @@ export default function App() {
     return set;
   }, [stitchSuggestions, hiddenPairs, merges]);
 
+  // Raw fragment size distribution (before stitching) — for the histogram
+  const fragmentCounts = useMemo(() => {
+    const raw = {};
+    csvData.body.forEach(pt => { raw[pt.bcid] = (raw[pt.bcid] || 0) + 1; });
+    const buckets = { '1–5': 0, '6–15': 0, '16–50': 0, '51–200': 0, '200+': 0 };
+    Object.values(raw).forEach(n => {
+      if (n <= 5) buckets['1–5']++;
+      else if (n <= 15) buckets['6–15']++;
+      else if (n <= 50) buckets['16–50']++;
+      else if (n <= 200) buckets['51–200']++;
+      else buckets['200+']++;
+    });
+    return { buckets, total: Object.values(raw).length };
+  }, [csvData.body]);
+
+  // Ordered segments per stitched group — for gap bridges + timeline bars
+  const stitchedSegments = useMemo(() => {
+    const result = {};
+    Object.entries(sortedGroupedData).forEach(([repBcid, pts]) => {
+      if (pts.length === 0) return;
+      const segments = [];
+      let segBcid = null, segStart = null, segEnd = null;
+      for (const pt of pts) {
+        if (pt.bcid !== segBcid) {
+          if (segBcid !== null) segments.push({ bcid: segBcid, start: segStart, end: segEnd });
+          segBcid = pt.bcid;
+          segStart = pt;
+        }
+        segEnd = pt;
+      }
+      if (segBcid !== null) segments.push({ bcid: segBcid, start: segStart, end: segEnd });
+      if (segments.length > 1) result[repBcid] = segments;
+    });
+    return result;
+  }, [sortedGroupedData]);
+
   // Global time range across all active display data (must come after displayData)
   const timeRange = useMemo(() => {
     const timestamps = displayData.map(d => d.timestamp).filter(t => t && !isNaN(t));
@@ -731,13 +775,15 @@ export default function App() {
       : null;
 
     // 2. Use pre-computed sorted groups (avoids re-sort every animation frame)
-    // 3. Render the paths
+    // 3. Render the paths — dim everything except focusedBcid when one is selected
     Object.entries(sortedGroupedData).forEach(([repBcid, sortedPoints]) => {
       if (hiddenBcids.has(repBcid)) return;
       if (pairHiddenBcids.has(repBcid)) return;
       if (searchQuery && !repBcid.toLowerCase().includes(searchQuery.toLowerCase())) return;
 
       const color = bcidColors[repBcid] || '#ccc';
+      // Dim non-focused paths when a focus is active
+      ctx.globalAlpha = focusedBcid && focusedBcid !== repBcid ? 0.12 : 1;
 
       // In animation mode, slice to points up to currentMaxTs (array is pre-sorted)
       // Also filter by selected zones if any are active
@@ -902,8 +948,72 @@ export default function App() {
         ctx.fillStyle = '#fff';
         ctx.fillText(label, labelX, labelY);
       }
+      ctx.globalAlpha = 1;
     });
-  }, [appState, sortedGroupedData, pairHiddenBcids, hiddenBcids, bcidColors, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones]);
+
+    // 4. Gap bridges: dashed lines between stitched segments with gap duration label
+    if (showGapBridges && Object.keys(stitchedSegments).length > 0) {
+      Object.entries(stitchedSegments).forEach(([repBcid, segs]) => {
+        if (hiddenBcids.has(repBcid) || pairHiddenBcids.has(repBcid)) return;
+        if (searchQuery && !repBcid.toLowerCase().includes(searchQuery.toLowerCase())) return;
+        if (focusedBcid && focusedBcid !== repBcid) return;
+        for (let i = 0; i < segs.length - 1; i++) {
+          const A = segs[i], B = segs[i + 1];
+          const x1 = A.end.sx ?? A.end.x, y1 = A.end.sy ?? A.end.y;
+          const x2 = B.start.sx ?? B.start.x, y2 = B.start.sy ?? B.start.y;
+          if (currentMaxTs && B.start.timestamp > currentMaxTs) continue;
+          const gapMs = B.start.timestamp - A.end.timestamp;
+          const gapLabel = gapMs < 1000 ? `${Math.round(gapMs)}ms` : `${(gapMs / 1000).toFixed(1)}s gap`;
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.strokeStyle = 'rgba(251,191,36,0.9)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 4]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // dot at each endpoint
+          ctx.beginPath(); ctx.arc(x1, y1, 4, 0, 2 * Math.PI);
+          ctx.fillStyle = 'rgba(251,191,36,0.9)'; ctx.fill();
+          ctx.beginPath(); ctx.arc(x2, y2, 4, 0, 2 * Math.PI);
+          ctx.fillStyle = 'rgba(251,191,36,0.9)'; ctx.fill();
+          // label at midpoint
+          const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+          ctx.font = 'bold 9px Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const tw = ctx.measureText(gapLabel).width;
+          ctx.fillStyle = 'rgba(30,20,0,0.7)';
+          ctx.beginPath();
+          ctx.roundRect(mx - tw / 2 - 3, my - 7, tw + 6, 14, 3);
+          ctx.fill();
+          ctx.fillStyle = '#fde68a';
+          ctx.fillText(gapLabel, mx, my);
+          ctx.restore();
+        }
+      });
+    }
+  }, [appState, sortedGroupedData, stitchedSegments, pairHiddenBcids, hiddenBcids, bcidColors, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones, focusedBcid, showGapBridges]);
+
+  // Click-to-focus: click a dot to isolate that BCID; click empty space to clear
+  const handleCanvasClick = (e) => {
+    if (!canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = canvasRef.current.width / rect.width;
+    const scaleY = canvasRef.current.height / rect.height;
+    const mouseX = (e.clientX - rect.left) * scaleX;
+    const mouseY = (e.clientY - rect.top) * scaleY;
+    let closest = null;
+    let minDist = 20;
+    for (const p of displayData) {
+      const repBcid = getMergedRepresentative(p.bcid, merges);
+      if (hiddenBcids.has(repBcid)) continue;
+      const dist = Math.hypot((p.sx ?? p.x) - mouseX, (p.sy ?? p.y) - mouseY);
+      if (dist < minDist) { minDist = dist; closest = repBcid; }
+    }
+    setFocusedBcid(prev => (closest && closest !== prev) ? closest : null);
+  };
 
   // Handle Mouse Hover for Tooltips
   const handleMouseMove = (e) => {
@@ -1192,7 +1302,18 @@ export default function App() {
               width={resolution.width}
               height={resolution.height}
               className="absolute inset-0 w-full h-full z-10 cursor-crosshair"
+              onClick={handleCanvasClick}
             />
+
+            {/* Focus banner */}
+            {focusedBcid && (
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-slate-900/90 text-white text-xs px-3 py-1.5 rounded-full shadow-lg">
+                <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: bcidColors[focusedBcid] }} />
+                <span className="font-mono font-bold">{focusedBcid}</span>
+                <span className="text-slate-400">focused</span>
+                <button onClick={() => setFocusedBcid(null)} className="ml-1 text-slate-400 hover:text-white font-bold">✕</button>
+              </div>
+            )}
 
             {hoveredPoint && (
               <div
@@ -1278,6 +1399,43 @@ export default function App() {
             <div className="p-4 flex-1 overflow-y-auto">
               {sidebarTab === 'legend' ? (
                 <>
+                  {/* Fragment quality histogram */}
+                  {fragmentCounts.total > 0 && (
+                    <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Fragment Size Distribution</span>
+                        <span className="text-[10px] text-slate-400">{fragmentCounts.total} raw IDs</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 mb-2 leading-snug">How many detections each raw BCID has before stitching. Many tiny fragments (&lt;6 pts) indicate dead zones or noise.</p>
+                      {Object.entries(fragmentCounts.buckets).map(([label, count]) => {
+                        const pct = fragmentCounts.total > 0 ? count / fragmentCounts.total : 0;
+                        const isSmall = label === '1–5';
+                        return (
+                          <div key={label} className="flex items-center gap-2 mb-1">
+                            <span className="text-[10px] text-slate-500 w-12 shrink-0">{label} pts</span>
+                            <div className="flex-1 bg-slate-200 rounded-full h-2 overflow-hidden">
+                              <div className={`h-full rounded-full ${isSmall ? 'bg-rose-400' : 'bg-indigo-400'}`} style={{ width: `${pct * 100}%` }} />
+                            </div>
+                            <span className="text-[10px] text-slate-500 w-6 text-right shrink-0">{count}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Gap bridge toggle */}
+                  {Object.keys(stitchedSegments).length > 0 && (
+                    <button
+                      onClick={() => setShowGapBridges(v => !v)}
+                      className={`w-full mb-3 py-1.5 text-xs font-bold rounded-lg border transition-colors flex items-center justify-center gap-1.5 ${showGapBridges ? 'bg-amber-50 text-amber-700 border-amber-300' : 'bg-white text-slate-500 border-slate-200 hover:border-amber-300'}`}
+                      title="Show dashed yellow lines where tracking was lost between stitched segments"
+                    >
+                      <span>⚡</span>
+                      {showGapBridges ? 'Hide Gap Bridges' : 'Show Gap Bridges'}
+                      <span className="text-[10px] font-normal opacity-70">— where tracking dropped</span>
+                    </button>
+                  )}
+
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Active Paths</h3>
                     <button
@@ -1332,28 +1490,38 @@ export default function App() {
                       .map(([bcid, stats]) => {
                       const color = bcidColors[bcid];
                       const isHidden = hiddenBcids.has(bcid);
+                      const isFocused = focusedBcid === bcid;
+                      const segs = stitchedSegments[bcid];
+                      const totalSpanMs = stats.maxTs - stats.minTs;
 
                       return (
                         <div
                           key={bcid}
-                          onClick={() => toggleBcidVisibility(bcid)}
-                          className={`flex flex-col p-2.5 rounded-lg cursor-pointer transition-colors border ${isHidden ? 'bg-slate-50 border-slate-200 opacity-60' : 'bg-white border-slate-200 shadow-sm hover:border-indigo-300'}`}
+                          className={`flex flex-col p-2.5 rounded-lg transition-colors border ${
+                            isFocused ? 'border-indigo-400 bg-indigo-50 shadow-md ring-1 ring-indigo-300'
+                            : isHidden ? 'bg-slate-50 border-slate-200 opacity-60'
+                            : 'bg-white border-slate-200 shadow-sm hover:border-indigo-300'
+                          }`}
                         >
                           <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-3 overflow-hidden">
-                              <div
-                                className="w-4 h-4 rounded-full shadow-inner flex-shrink-0"
-                                style={{ backgroundColor: color }}
-                              />
-                              <span className={`text-sm font-semibold ${isHidden ? 'line-through text-slate-400' : 'text-slate-700'} truncate max-w-[120px]`} title={bcid}>
+                            <div
+                              className="flex items-center gap-3 overflow-hidden flex-1 cursor-pointer"
+                              onClick={() => setFocusedBcid(prev => prev === bcid ? null : bcid)}
+                              title="Click to focus this path on the map"
+                            >
+                              <div className="w-4 h-4 rounded-full shadow-inner flex-shrink-0" style={{ backgroundColor: color }} />
+                              <span className={`text-sm font-semibold ${isHidden ? 'line-through text-slate-400' : isFocused ? 'text-indigo-700' : 'text-slate-700'} truncate max-w-[110px]`} title={bcid}>
                                 {bcid}
                               </span>
+                              {isFocused && <span className="text-[9px] font-bold text-indigo-500 bg-indigo-100 px-1.5 py-0.5 rounded-full shrink-0">FOCUSED</span>}
                             </div>
-                            <div className="flex items-center gap-2 flex-shrink-0">
-                              <span className="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full whitespace-nowrap">
+                            <div className="flex items-center gap-1.5 flex-shrink-0">
+                              <span className="text-[10px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded-full whitespace-nowrap">
                                 {stats.count} pt • {stats.durationStr}
                               </span>
-                              {isHidden ? <EyeOff className="w-4 h-4 text-slate-400" /> : <Eye className="w-4 h-4 text-slate-600" />}
+                              <button onClick={() => toggleBcidVisibility(bcid)} className="p-0.5 hover:bg-slate-100 rounded">
+                                {isHidden ? <EyeOff className="w-3.5 h-3.5 text-slate-400" /> : <Eye className="w-3.5 h-3.5 text-slate-500" />}
+                              </button>
                             </div>
                           </div>
                           <div className="mt-1.5 pl-7 flex items-center gap-1 text-[10px] text-slate-400 font-medium">
@@ -1361,9 +1529,43 @@ export default function App() {
                             <span className="text-slate-300">→</span>
                             <span>{stats.endStr}</span>
                           </div>
+
+                          {/* Journey timeline bar for stitched groups */}
+                          {segs && totalSpanMs > 0 && (
+                            <div className="mt-2 pl-7" title="Timeline of stitched segments. Yellow gaps = tracking dropped between IDs.">
+                              <div className="text-[9px] text-slate-400 mb-1">Journey timeline ({segs.length} segments stitched)</div>
+                              <div className="relative h-3 bg-slate-100 rounded-full overflow-hidden flex">
+                                {segs.map((seg, i) => {
+                                  const segStart = ((seg.start.timestamp - stats.minTs) / totalSpanMs) * 100;
+                                  const segWidth = ((seg.end.timestamp - seg.start.timestamp) / totalSpanMs) * 100;
+                                  return (
+                                    <div
+                                      key={i}
+                                      className="absolute h-full rounded-sm"
+                                      style={{ left: `${segStart}%`, width: `${Math.max(segWidth, 1)}%`, backgroundColor: color, opacity: 0.85 }}
+                                      title={`Segment ${i + 1}: ${seg.bcid}`}
+                                    />
+                                  );
+                                })}
+                                {/* Gap markers */}
+                                {segs.slice(0, -1).map((seg, i) => {
+                                  const gapStart = ((seg.end.timestamp - stats.minTs) / totalSpanMs) * 100;
+                                  const gapWidth = ((segs[i + 1].start.timestamp - seg.end.timestamp) / totalSpanMs) * 100;
+                                  return gapWidth > 0.5 ? (
+                                    <div key={`g${i}`} className="absolute h-full bg-amber-300 opacity-70" style={{ left: `${gapStart}%`, width: `${Math.max(gapWidth, 0.5)}%` }} title={`Gap: ${((segs[i+1].start.timestamp - seg.end.timestamp)/1000).toFixed(1)}s`} />
+                                  ) : null;
+                                })}
+                              </div>
+                              <div className="flex justify-between text-[9px] text-slate-300 mt-0.5">
+                                <span>track</span>
+                                <span className="text-amber-400">gap</span>
+                              </div>
+                            </div>
+                          )}
+
                           {stats.mergedChildren.length > 0 && (
-                            <div className="mt-1 pl-7 text-[10px] text-slate-400 font-medium">
-                              Stitched with: {stats.mergedChildren.join(', ')}
+                            <div className="mt-1 pl-7 text-[10px] text-slate-400">
+                              Stitched: {stats.mergedChildren.length} segment{stats.mergedChildren.length > 1 ? 's' : ''}
                             </div>
                           )}
                         </div>
@@ -1462,7 +1664,15 @@ export default function App() {
 
                             <div className="flex items-center justify-between pt-2 border-t border-slate-100 text-[11px] text-slate-500">
                               <span>Gap: <strong>{Math.round(sug.timeGapMs / 100) / 10}s</strong></span>
-                              <span>Distance: <strong>{Math.round(sug.distance)}px</strong></span>
+                              <span>Dist: <strong>{Math.round(sug.distance)}px</strong></span>
+                              <span
+                                className={`flex items-center gap-0.5 font-bold ${sug.speedPxPerSec > 300 ? 'text-rose-500' : 'text-slate-500'}`}
+                                title={sug.speedPxPerSec > 300
+                                  ? `Implied speed ${Math.round(sug.speedPxPerSec)} px/s is unusually fast — may be two different people`
+                                  : `Implied crossing speed: ${Math.round(sug.speedPxPerSec)} px/s`}
+                              >
+                                {sug.speedPxPerSec > 300 ? '⚠️' : '🚶'} {Math.round(sug.speedPxPerSec)}px/s
+                              </span>
                             </div>
 
                             {/* Actions row */}
