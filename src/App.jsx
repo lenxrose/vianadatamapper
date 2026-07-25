@@ -12,7 +12,11 @@ export default function App() {
   const [dataSource, setDataSource] = useState('body'); // 'body' | 'touches' | 'combined'
 
   const [bcidColors, setBcidColors] = useState({});
+  const [scidColors, setScidColors] = useState({});
+  const [colorBy, setColorBy] = useState('bcid'); // 'bcid' | 'scid'
   const [hiddenBcids, setHiddenBcids] = useState(new Set());
+  const [hiddenScids, setHiddenScids] = useState(new Set());
+  const [showScidCoverage, setShowScidCoverage] = useState(false);
   const [scaleCoordinates, setScaleCoordinates] = useState(false);
   const [resolution, setResolution] = useState({ width: 1743, height: 733 });
   const [hoveredPoint, setHoveredPoint] = useState(null);
@@ -140,9 +144,11 @@ export default function App() {
     const touchPoints = [];
     let isNormalized = true;
 
-    const addBody = (id, bcid, x, y, timestamp) => {
+    const scidIdx = headers.indexOf('scid');
+
+    const addBody = (id, bcid, scid, x, y, timestamp) => {
       if (x > 2 || y > 2) isNormalized = false;
-      bodyPoints.push({ id, rowIndex: id, bcid, rawX: x, rawY: y, timestamp, type: 'body' });
+      bodyPoints.push({ id, rowIndex: id, bcid, scid: scid || 'unknown', rawX: x, rawY: y, timestamp, type: 'body' });
     };
 
     for (let i = 1; i < lines.length; i++) {
@@ -151,6 +157,7 @@ export default function App() {
 
       const tsStr = eventTsIdx !== -1 ? row[eventTsIdx] : null;
       const timestamp = tsStr ? new Date(tsStr).getTime() : i * 100;
+      const rowScid = scidIdx !== -1 ? row[scidIdx] : null;
 
       // 1. Try to extract multiple bcids from the `outputs` JSON column
       let extractedFromOutputs = false;
@@ -161,9 +168,10 @@ export default function App() {
           if (Array.isArray(outputs)) {
             outputs.forEach((entry, oIdx) => {
               const bcid = entry.bcid;
+              const scid = entry.scid || rowScid;
               const fp = entry.floor_pt_fused;
               if (bcid && Array.isArray(fp) && fp.length >= 2) {
-                addBody(`b${i}-${oIdx}`, bcid, parseFloat(fp[0]), parseFloat(fp[1]), timestamp);
+                addBody(`b${i}-${oIdx}`, bcid, scid, parseFloat(fp[0]), parseFloat(fp[1]), timestamp);
                 extractedFromOutputs = true;
               }
               // Touch points nested inside outputs
@@ -173,7 +181,7 @@ export default function App() {
                   if (fp2 && fp2.x != null && fp2.y != null) {
                     const tx = parseFloat(fp2.x), ty = parseFloat(fp2.y);
                     if (tx > 2 || ty > 2) isNormalized = false;
-                    touchPoints.push({ id: `t${i}-${oIdx}-${tIdx}`, rowIndex: i, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
+                    touchPoints.push({ id: `t${i}-${oIdx}-${tIdx}`, rowIndex: i, bcid, scid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
                   }
                 });
               }
@@ -191,7 +199,7 @@ export default function App() {
 
         if (floorPtIdx !== -1 && row[floorPtIdx]) {
           const match = row[floorPtIdx].match(/\[\s*([\d.-]+)\s*,\s*([\d.-]+)/);
-          if (match) addBody(`b${i}`, bcid, parseFloat(match[1]), parseFloat(match[2]), timestamp);
+          if (match) addBody(`b${i}`, bcid, rowScid, parseFloat(match[1]), parseFloat(match[2]), timestamp);
         }
 
         if (touchesIdx !== -1 && row[touchesIdx]) {
@@ -238,11 +246,11 @@ export default function App() {
     let isNormalized = true;
     let rowIndex = 0;
     let headers = null;
-    let eventTsIdx, outputsIdx, bcidIdx, floorPtIdx, touchesIdx;
+    let eventTsIdx, outputsIdx, bcidIdx, floorPtIdx, touchesIdx, scidIdx;
 
-    const addBody = (id, bcid, x, y, timestamp) => {
+    const addBody = (id, bcid, scid, x, y, timestamp) => {
       if (x > 2 || y > 2) isNormalized = false;
-      bodyPoints.push({ id, rowIndex: id, bcid, rawX: x, rawY: y, timestamp, type: 'body' });
+      bodyPoints.push({ id, rowIndex: id, bcid, scid: scid || 'unknown', rawX: x, rawY: y, timestamp, type: 'body' });
     };
 
     setCsvLoading(true);
@@ -262,13 +270,15 @@ export default function App() {
               ? headers.indexOf('floor_pt_fused')
               : headers.indexOf('floor_pt');
             touchesIdx  = headers.indexOf('touches');
-            console.log('[CSV] outputsIdx:', outputsIdx, 'bcidIdx:', bcidIdx, 'floorPtIdx:', floorPtIdx);
+            scidIdx     = headers.indexOf('scid');
+            console.log('[CSV] outputsIdx:', outputsIdx, 'bcidIdx:', bcidIdx, 'floorPtIdx:', floorPtIdx, 'scidIdx:', scidIdx);
             continue;
           }
 
           rowIndex++;
           const tsStr = eventTsIdx !== -1 ? row[eventTsIdx] : null;
           const timestamp = tsStr ? new Date(tsStr).getTime() : rowIndex * 100;
+          const rowScid = scidIdx !== -1 ? row[scidIdx] : null;
 
           // Try outputs JSON first (multiple BCIDs per row)
           let extractedFromOutputs = false;
@@ -278,9 +288,10 @@ export default function App() {
               if (Array.isArray(outputs)) {
                 outputs.forEach((entry, oIdx) => {
                   const bcid = entry.bcid;
+                  const scid = entry.scid || rowScid;
                   const fp = entry.floor_pt_fused;
                   if (bcid && Array.isArray(fp) && fp.length >= 2) {
-                    addBody(`b${rowIndex}-${oIdx}`, bcid, parseFloat(fp[0]), parseFloat(fp[1]), timestamp);
+                    addBody(`b${rowIndex}-${oIdx}`, bcid, scid, parseFloat(fp[0]), parseFloat(fp[1]), timestamp);
                     extractedFromOutputs = true;
                   }
                   if (entry.touches && Array.isArray(entry.touches)) {
@@ -289,7 +300,7 @@ export default function App() {
                       if (fp2?.x != null && fp2?.y != null) {
                         const tx = parseFloat(fp2.x), ty = parseFloat(fp2.y);
                         if (tx > 2 || ty > 2) isNormalized = false;
-                        touchPoints.push({ id: `t${rowIndex}-${oIdx}-${tIdx}`, rowIndex, bcid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
+                        touchPoints.push({ id: `t${rowIndex}-${oIdx}-${tIdx}`, rowIndex, bcid, scid, rawX: tx, rawY: ty, timestamp, type: 'touch' });
                       }
                     });
                   }
@@ -304,7 +315,7 @@ export default function App() {
             if (!bcid) continue;
             if (floorPtIdx !== -1 && row[floorPtIdx]) {
               const match = row[floorPtIdx].match(/\[\s*([\d.-]+)\s*,\s*([\d.-]+)/);
-              if (match) addBody(`b${rowIndex}`, bcid, parseFloat(match[1]), parseFloat(match[2]), timestamp);
+              if (match) addBody(`b${rowIndex}`, bcid, rowScid, parseFloat(match[1]), parseFloat(match[2]), timestamp);
             }
             if (touchesIdx !== -1 && row[touchesIdx]) {
               const touchMatches = [...row[touchesIdx].matchAll(/floor_pt[^\w{]*\{([^}]+)\}/g)];
@@ -332,11 +343,16 @@ export default function App() {
         const colors = {};
         const allUniqueBcids = [...new Set([...bodyPoints.map(d => d.bcid), ...touchPoints.map(d => d.bcid)])];
         allUniqueBcids.forEach((id, index) => {
-          // Golden-angle distribution: consecutive BCIDs get maximally distinct hues
           colors[id] = `hsl(${Math.round((index * 137.508) % 360)}, 78%, 62%)`;
+        });
+        const sColors = {};
+        const allUniqueScids = [...new Set([...bodyPoints.map(d => d.scid), ...touchPoints.map(d => d.scid)].filter(Boolean))];
+        allUniqueScids.forEach((id, index) => {
+          sColors[id] = `hsl(${Math.round((index * 137.508) % 360)}, 85%, 58%)`;
         });
         setScaleCoordinates(isNormalized);
         setBcidColors(colors);
+        setScidColors(sColors);
         setCsvData(parsedData);
         setMerges({});
       },
@@ -639,6 +655,39 @@ export default function App() {
     return set;
   }, [stitchSuggestions, hiddenPairs, merges]);
 
+  // Per-camera (SCID) stats for the camera view
+  const scidStats = useMemo(() => {
+    const stats = {};
+    displayData.forEach(d => {
+      const id = d.scid || 'unknown';
+      if (!stats[id]) stats[id] = { count: 0, xs: [], ys: [], bcids: new Set(), minTs: Infinity, maxTs: -Infinity };
+      stats[id].count++;
+      stats[id].xs.push(d.x);
+      stats[id].ys.push(d.y);
+      stats[id].bcids.add(d.bcid);
+      if (d.timestamp < stats[id].minTs) stats[id].minTs = d.timestamp;
+      if (d.timestamp > stats[id].maxTs) stats[id].maxTs = d.timestamp;
+    });
+    Object.entries(stats).forEach(([id, s]) => {
+      const meanX = s.xs.reduce((a, b) => a + b, 0) / s.xs.length;
+      const meanY = s.ys.reduce((a, b) => a + b, 0) / s.ys.length;
+      const varX = s.xs.reduce((a, b) => a + (b - meanX) ** 2, 0) / s.xs.length;
+      const varY = s.ys.reduce((a, b) => a + (b - meanY) ** 2, 0) / s.ys.length;
+      s.stdDev = Math.round(Math.sqrt(varX + varY));
+      s.centroid = { x: Math.round(meanX), y: Math.round(meanY) };
+      s.minX = Math.round(Math.min(...s.xs)); s.maxX = Math.round(Math.max(...s.xs));
+      s.minY = Math.round(Math.min(...s.ys)); s.maxY = Math.round(Math.max(...s.ys));
+      s.bcidCount = s.bcids.size;
+      const diffSec = Math.max(0, Math.round((s.maxTs - s.minTs) / 1000));
+      s.durationStr = diffSec > 60 ? `${Math.floor(diffSec/60)}m ${diffSec%60}s` : `${diffSec}s`;
+      // Stability: low stdDev relative to canvas size = stable. Score 0–100.
+      const diag = Math.hypot(resolution.width, resolution.height);
+      s.stability = Math.max(0, Math.round((1 - Math.min(s.stdDev / (diag * 0.3), 1)) * 100));
+      delete s.xs; delete s.ys; // free memory
+    });
+    return stats;
+  }, [displayData, resolution]);
+
   // Raw fragment size distribution (before stitching) — for the histogram
   const fragmentCounts = useMemo(() => {
     const raw = {};
@@ -781,17 +830,20 @@ export default function App() {
       if (pairHiddenBcids.has(repBcid)) return;
       if (searchQuery && !repBcid.toLowerCase().includes(searchQuery.toLowerCase())) return;
 
-      const color = bcidColors[repBcid] || '#ccc';
+      const color = colorBy === 'scid'
+        ? (scidColors[sortedPoints[0]?.scid] || '#ccc')
+        : (bcidColors[repBcid] || '#ccc');
       // Dim non-focused paths when a focus is active
       ctx.globalAlpha = focusedBcid && focusedBcid !== repBcid ? 0.12 : 1;
 
       // In animation mode, slice to points up to currentMaxTs (array is pre-sorted)
-      // Also filter by selected zones if any are active
+      // Also filter by selected zones, hidden SCIDs
       let visiblePoints = sortedPoints;
-      if (currentMaxTs || selectedZones.size > 0) {
+      if (currentMaxTs || selectedZones.size > 0 || (colorBy === 'scid' && hiddenScids.size > 0)) {
         visiblePoints = sortedPoints.filter(p => {
           if (currentMaxTs && p.timestamp > currentMaxTs) return false;
           if (selectedZones.size > 0 && !selectedZones.has(getZoneId(p.x, p.y))) return false;
+          if (colorBy === 'scid' && hiddenScids.has(p.scid)) return false;
           return true;
         });
       }
@@ -994,7 +1046,34 @@ export default function App() {
         }
       });
     }
-  }, [appState, sortedGroupedData, stitchedSegments, pairHiddenBcids, hiddenBcids, bcidColors, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones, focusedBcid, showGapBridges]);
+    // 5. SCID coverage bounding boxes
+    if (showScidCoverage && colorBy === 'scid') {
+      Object.entries(scidStats).forEach(([scid, s]) => {
+        if (hiddenScids.has(scid)) return;
+        const col = scidColors[scid] || '#ccc';
+        const pad = 6;
+        ctx.save();
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 3]);
+        ctx.globalAlpha = 0.7;
+        ctx.strokeRect(s.minX - pad, s.minY - pad, (s.maxX - s.minX) + pad * 2, (s.maxY - s.minY) + pad * 2);
+        ctx.setLineDash([]);
+        // SCID label at top-left of box
+        ctx.globalAlpha = 1;
+        ctx.font = 'bold 11px Arial';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'bottom';
+        const lbl = `Cam ${scid}`;
+        const tw = ctx.measureText(lbl).width;
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        ctx.fillRect(s.minX - pad, s.minY - pad - 16, tw + 8, 16);
+        ctx.fillStyle = col;
+        ctx.fillText(lbl, s.minX - pad + 4, s.minY - pad);
+        ctx.restore();
+      });
+    }
+  }, [appState, sortedGroupedData, stitchedSegments, pairHiddenBcids, hiddenBcids, hiddenScids, bcidColors, scidColors, colorBy, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones, focusedBcid, showGapBridges, showScidCoverage, scidStats]);
 
   // Click-to-focus: click a dot to isolate that BCID; click empty space to clear
   const handleCanvasClick = (e) => {
@@ -1161,6 +1240,20 @@ export default function App() {
               <option value="dots">Dots</option>
               <option value="trail">Trail Lines</option>
               <option value="arrows">Direction Arrows</option>
+            </select>
+          </div>
+
+          <div className="h-6 border-l border-slate-300 mx-1 hidden sm:block"></div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-slate-600 font-medium">Color by:</span>
+            <select
+              value={colorBy}
+              onChange={(e) => setColorBy(e.target.value)}
+              className="bg-slate-50 border border-slate-200 text-slate-700 font-medium rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-shadow cursor-pointer"
+            >
+              <option value="bcid">BCID (Person)</option>
+              <option value="scid">SCID (Camera)</option>
             </select>
           </div>
 
@@ -1393,6 +1486,12 @@ export default function App() {
                 className={`flex-1 py-2 text-xs font-bold rounded-md transition-all flex items-center justify-center gap-1.5 ${sidebarTab === 'pattern' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500 hover:text-slate-800'}`}
               >
                 <Search className="w-3.5 h-3.5" /> Pattern
+              </button>
+              <button
+                onClick={() => setSidebarTab('camera')}
+                className={`flex-1 py-2 text-xs font-bold rounded-md transition-all flex items-center justify-center gap-1.5 ${sidebarTab === 'camera' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500 hover:text-slate-800'}`}
+              >
+                📷 Camera
               </button>
             </div>
 
@@ -1965,6 +2064,79 @@ export default function App() {
                       </div>
                     </div>
                   )}
+                </>
+              ) : sidebarTab === 'camera' ? (
+                <>
+                  <div className="mb-3">
+                    <p className="text-[11px] text-slate-500 leading-snug">Per-camera (SCID) detection stability. Low std dev = camera tracks tightly. High std dev = detections are scattered.</p>
+                  </div>
+                  <div className="mb-3 flex items-center gap-2">
+                    <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={showScidCoverage}
+                        onChange={e => setShowScidCoverage(e.target.checked)}
+                        className="rounded"
+                      />
+                      Show coverage boxes on map
+                    </label>
+                  </div>
+                  <div className="space-y-2">
+                    {Object.entries(scidStats).sort((a, b) => b[1].count - a[1].count).map(([scid, s]) => {
+                      const col = scidColors[scid] || '#ccc';
+                      const isHidden = hiddenScids.has(scid);
+                      return (
+                        <div
+                          key={scid}
+                          className={`rounded-lg border p-3 transition-opacity ${isHidden ? 'opacity-40' : ''}`}
+                          style={{ borderColor: col + '55', background: col + '11' }}
+                        >
+                          <div className="flex items-center justify-between mb-1.5">
+                            <div className="flex items-center gap-2">
+                              <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: col }} />
+                              <span className="text-xs font-bold text-slate-700">Cam {scid}</span>
+                            </div>
+                            <button
+                              onClick={() => setHiddenScids(prev => {
+                                const next = new Set(prev);
+                                next.has(scid) ? next.delete(scid) : next.add(scid);
+                                return next;
+                              })}
+                              className="text-[10px] text-slate-400 hover:text-slate-700 transition-colors"
+                            >
+                              {isHidden ? 'Show' : 'Hide'}
+                            </button>
+                          </div>
+                          {/* Stability bar */}
+                          <div className="mb-2">
+                            <div className="flex justify-between text-[10px] text-slate-500 mb-0.5">
+                              <span>Stability</span>
+                              <span className="font-bold" style={{ color: s.stability >= 70 ? '#16a34a' : s.stability >= 40 ? '#d97706' : '#dc2626' }}>{s.stability}%</span>
+                            </div>
+                            <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${s.stability}%`,
+                                  background: s.stability >= 70 ? '#16a34a' : s.stability >= 40 ? '#d97706' : '#dc2626'
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
+                            <span>Points: <span className="font-semibold text-slate-700">{s.count.toLocaleString()}</span></span>
+                            <span>BCIDs: <span className="font-semibold text-slate-700">{s.bcidCount}</span></span>
+                            <span>Std Dev: <span className="font-semibold text-slate-700">{s.stdDev}px</span></span>
+                            <span>Duration: <span className="font-semibold text-slate-700">{s.durationStr}</span></span>
+                            <span className="col-span-2">Centroid: <span className="font-semibold text-slate-700">({s.centroid.x}, {s.centroid.y})</span></span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {Object.keys(scidStats).length === 0 && (
+                      <p className="text-xs text-slate-400 text-center py-6">No SCID data found in CSV.<br/>Make sure your CSV has a <code>scid</code> column.</p>
+                    )}
+                  </div>
                 </>
               ) : null}
             </div>
