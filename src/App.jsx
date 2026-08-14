@@ -348,12 +348,14 @@ export default function App() {
         }
         const parsedData = { body: bodyPoints, touches: touchPoints };
         const colors = {};
-        const allUniqueBcids = [...new Set([...bodyPoints.map(d => d.bcid), ...touchPoints.map(d => d.bcid)])];
+        const bcidSet = new Set(); bodyPoints.forEach(d => bcidSet.add(d.bcid)); touchPoints.forEach(d => bcidSet.add(d.bcid));
+        const allUniqueBcids = [...bcidSet];
         allUniqueBcids.forEach((id, index) => {
           colors[id] = `hsl(${Math.round((index * 137.508) % 360)}, 78%, 62%)`;
         });
         const sColors = {};
-        const allUniqueScids = [...new Set([...bodyPoints.map(d => d.scid), ...touchPoints.map(d => d.scid)].filter(Boolean))];
+        const scidSet = new Set(); bodyPoints.forEach(d => d.scid && scidSet.add(d.scid)); touchPoints.forEach(d => d.scid && scidSet.add(d.scid));
+        const allUniqueScids = [...scidSet];
         allUniqueScids.forEach((id, index) => {
           sColors[id] = `hsl(${Math.round((index * 137.508) % 360)}, 85%, 58%)`;
         });
@@ -741,9 +743,14 @@ export default function App() {
 
   // Global time range across all active display data (must come after displayData)
   const timeRange = useMemo(() => {
-    const timestamps = displayData.map(d => d.timestamp).filter(t => t && !isNaN(t));
-    if (timestamps.length === 0) return null;
-    return { min: Math.min(...timestamps), max: Math.max(...timestamps) };
+    let min = Infinity, max = -Infinity;
+    displayData.forEach(d => {
+      if (d.timestamp && !isNaN(d.timestamp)) {
+        if (d.timestamp < min) min = d.timestamp;
+        if (d.timestamp > max) max = d.timestamp;
+      }
+    });
+    return min === Infinity ? null : { min, max };
   }, [displayData]);
 
   // Handle manual stitch action
@@ -788,7 +795,7 @@ export default function App() {
 
     // 0. Zone overlay
     if (showZoneOverlay && Object.keys(zoneDensity).length > 0) {
-      const maxDensity = Math.max(...Object.values(zoneDensity));
+      const maxDensity = Object.values(zoneDensity).reduce((a, b) => b > a ? b : a, 0);
       const cellW = canvas.width / gridCols;
       const cellH = canvas.height / gridRows;
       for (let c = 0; c < gridCols; c++) {
@@ -1952,7 +1959,7 @@ export default function App() {
                         Array.from({ length: gridCols }, (_, c) => {
                           const zid = `${c}:${r}`;
                           const count = zoneDensity[zid] || 0;
-                          const maxD = Math.max(1, ...Object.values(zoneDensity));
+                          const maxD = Math.max(1, Object.values(zoneDensity).reduce((a, b) => b > a ? b : a, 0));
                           const intensity = count / maxD;
                           const isSelected = selectedZones.has(zid);
                           return (
