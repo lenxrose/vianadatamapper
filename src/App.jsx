@@ -685,8 +685,11 @@ export default function App() {
       const varY = s.ys.reduce((a, b) => a + (b - meanY) ** 2, 0) / s.ys.length;
       s.stdDev = Math.round(Math.sqrt(varX + varY));
       s.centroid = { x: Math.round(meanX), y: Math.round(meanY) };
-      s.minX = Math.round(Math.min(...s.xs)); s.maxX = Math.round(Math.max(...s.xs));
-      s.minY = Math.round(Math.min(...s.ys)); s.maxY = Math.round(Math.max(...s.ys));
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (let i = 0; i < s.xs.length; i++) { if (s.xs[i] < minX) minX = s.xs[i]; if (s.xs[i] > maxX) maxX = s.xs[i]; }
+      for (let i = 0; i < s.ys.length; i++) { if (s.ys[i] < minY) minY = s.ys[i]; if (s.ys[i] > maxY) maxY = s.ys[i]; }
+      s.minX = Math.round(minX); s.maxX = Math.round(maxX);
+      s.minY = Math.round(minY); s.maxY = Math.round(maxY);
       s.bcidCount = s.bcids.size;
       const diffSec = Math.max(0, Math.round((s.maxTs - s.minTs) / 1000));
       s.durationStr = diffSec > 60 ? `${Math.floor(diffSec/60)}m ${diffSec%60}s` : `${diffSec}s`;
