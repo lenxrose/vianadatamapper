@@ -372,7 +372,7 @@ export default function App() {
 
   // Analyze CSV endpoints to find connectable paths
   const stitchSuggestions = useMemo(() => {
-    if (csvData.body.length === 0) return [];
+    if (appState !== 'map' || csvData.body.length === 0) return [];
 
     // Group body detections by BCID
     const tracks = {};
@@ -386,52 +386,52 @@ export default function App() {
     Object.entries(tracks).forEach(([bcid, pts]) => {
       if (pts.length === 0) return;
       const sorted = [...pts].sort((a, b) => a.timestamp - b.timestamp);
-      bounds.push({
-        bcid,
-        start: sorted[0],
-        end: sorted[sorted.length - 1]
-      });
+      bounds.push({ bcid, start: sorted[0], end: sorted[sorted.length - 1] });
     });
+
+    // Cap at 2000 tracks to avoid O(n²) freeze on huge datasets
+    const MAX_TRACKS = 2000;
+    const workingBounds = bounds.length > MAX_TRACKS
+      ? bounds.sort((a, b) => b.end.timestamp - a.end.timestamp).slice(0, MAX_TRACKS)
+      : bounds;
+
+    // Sort by end timestamp so inner loop can break early
+    workingBounds.sort((a, b) => a.end.timestamp - b.end.timestamp);
 
     const suggestions = [];
     const maxTimeGapMs = maxTimeGapSec * 1000;
     const maxDistPixels = maxDistPx;
 
-    // Match end of A to start of B
-    for (let i = 0; i < bounds.length; i++) {
-      const trackA = bounds[i];
-      for (let j = 0; j < bounds.length; j++) {
+    for (let i = 0; i < workingBounds.length; i++) {
+      const trackA = workingBounds[i];
+      const ax = scaleCoordinates ? trackA.end.rawX * resolution.width : trackA.end.rawX;
+      const ay = scaleCoordinates ? trackA.end.rawY * resolution.height : trackA.end.rawY;
+      for (let j = 0; j < workingBounds.length; j++) {
         if (i === j) continue;
-        const trackB = bounds[j];
-
+        const trackB = workingBounds[j];
         const timeGap = trackB.start.timestamp - trackA.end.timestamp;
-        if (timeGap > 0 && timeGap <= maxTimeGapMs) {
-          const ax = scaleCoordinates ? trackA.end.rawX * resolution.width : trackA.end.rawX;
-          const ay = scaleCoordinates ? trackA.end.rawY * resolution.height : trackA.end.rawY;
-          const bx = scaleCoordinates ? trackB.start.rawX * resolution.width : trackB.start.rawX;
-          const by = scaleCoordinates ? trackB.start.rawY * resolution.height : trackB.start.rawY;
-
-          const dist = Math.hypot(bx - ax, by - ay);
-          if (dist <= maxDistPixels) {
-            const speedPxPerSec = timeGap > 0 ? dist / (timeGap / 1000) : 0;
-            suggestions.push({
-              id: `${trackA.bcid}-${trackB.bcid}`,
-              from: trackA.bcid,
-              to: trackB.bcid,
-              timeGapMs: timeGap,
-              distance: dist,
-              speedPxPerSec,
-              fromPt: { x: ax, y: ay },
-              toPt: { x: bx, y: by }
-            });
-          }
+        if (timeGap <= 0) continue;
+        if (timeGap > maxTimeGapMs) continue;
+        const bx = scaleCoordinates ? trackB.start.rawX * resolution.width : trackB.start.rawX;
+        const by = scaleCoordinates ? trackB.start.rawY * resolution.height : trackB.start.rawY;
+        const dist = Math.hypot(bx - ax, by - ay);
+        if (dist <= maxDistPixels) {
+          suggestions.push({
+            id: `${trackA.bcid}-${trackB.bcid}`,
+            from: trackA.bcid,
+            to: trackB.bcid,
+            timeGapMs: timeGap,
+            distance: dist,
+            speedPxPerSec: dist / (timeGap / 1000),
+            fromPt: { x: ax, y: ay },
+            toPt: { x: bx, y: by }
+          });
         }
       }
     }
 
-    // Sort by proximity score (closer in space + time is ranked higher)
     return suggestions.sort((a, b) => (a.distance + a.timeGapMs / 500) - (b.distance + b.timeGapMs / 500));
-  }, [csvData.body, scaleCoordinates, resolution, maxTimeGapSec, maxDistPx]);
+  }, [appState, csvData.body, scaleCoordinates, resolution, maxTimeGapSec, maxDistPx]);
 
   // Helper: resolve pixel coords from a raw point
   const toPixel = (pt) => ({
@@ -448,6 +448,7 @@ export default function App() {
 
   // Dwell segments per BCID
   const dwellSegments = useMemo(() => {
+    if (appState !== 'map') return {};
     const result = {};
     const tracks = {};
     csvData.body.forEach(pt => {
@@ -483,10 +484,11 @@ export default function App() {
       }
     });
     return result;
-  }, [csvData.body, scaleCoordinates, resolution, dwellRadiusPx, dwellMinSec, gridCols, gridRows]);
+  }, [appState, csvData.body, scaleCoordinates, resolution, dwellRadiusPx, dwellMinSec, gridCols, gridRows]);
 
   // Zone transition matrix + zone traffic density
   const { transitionMatrix, zoneDensity } = useMemo(() => {
+    if (appState !== 'map') return { transitionMatrix: {}, zoneDensity: {} };
     const counts = {};
     const fromCounts = {};
     const density = {};
@@ -520,7 +522,7 @@ export default function App() {
     });
 
     return { transitionMatrix: matrix, zoneDensity: density };
-  }, [csvData.body, scaleCoordinates, resolution, gridCols, gridRows]);
+  }, [appState, csvData.body, scaleCoordinates, resolution, gridCols, gridRows]);
 
   // Pattern score per stitch suggestion (0–100)
   const patternScores = useMemo(() => {
