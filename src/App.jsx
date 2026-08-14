@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Map as MapIcon, Settings, Eye, EyeOff, Info, CheckCircle2, Search, ZoomIn, ZoomOut, Menu, GitCommit, HelpCircle, RefreshCw, Play, Pause, SkipBack } from 'lucide-react';
 import Papa from 'papaparse';
+import imgJnys from './assets/floorplan.jpeg';
+import imgRundleMall from './assets/rundlemall.png';
+import imgScRetail from './assets/sc_retailNB.png';
+import imgNewBalance from './assets/newbalance.png';
 
 export default function App() {
   const [appState, setAppState] = useState('setup'); // 'setup', 'loading', 'map'
@@ -1169,17 +1173,50 @@ export default function App() {
           </div>
 
           <div className="space-y-6">
-            <div className={`border-2 border-dashed rounded-xl p-6 transition-colors ${imageSrc ? 'border-green-400 bg-green-50' : 'border-slate-300 hover:border-indigo-400 bg-slate-50'}`}>
-              <label className="flex flex-col items-center cursor-pointer">
-                {imageSrc ? <CheckCircle2 className="text-green-500 w-10 h-10 mb-2" /> : <Upload className="text-slate-400 w-10 h-10 mb-2" />}
-                <span className="text-sm font-medium text-slate-700">
-                  {imageSrc ? 'Floor Plan Loaded Successfully' : '1. Upload Floor Plan Image'}
-                </span>
-                <span className="text-xs text-slate-500 mt-1">Accepts JPG, PNG</span>
-                <input type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
-              </label>
+            {/* Floor Plan: preset or upload */}
+            <div>
+              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">1. Floor Plan</p>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                {[
+                  { label: 'Jnys', file: imgJnys, w: 1743, h: 733 },
+                  { label: 'New Balance · Rundle Mall', file: imgRundleMall, w: 1342, h: 351 },
+                  { label: 'New Balance · SC Retail', file: imgScRetail, w: 2730, h: 1536 },
+                  { label: 'New Balance · Store', file: imgNewBalance, w: 1920, h: 900 },
+                ].map(preset => {
+                  const isSelected = imageSrc === preset.file;
+                  return (
+                    <button
+                      key={preset.file}
+                      onClick={() => {
+                        setImageSrc(preset.file);
+                        setResolution({ width: preset.w, height: preset.h });
+                      }}
+                      className={`rounded-xl border-2 p-3 text-left transition-all ${isSelected ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 hover:border-indigo-300 bg-slate-50'}`}
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        {isSelected
+                          ? <CheckCircle2 className="w-4 h-4 text-indigo-500 flex-shrink-0" />
+                          : <MapIcon className="w-4 h-4 text-slate-400 flex-shrink-0" />}
+                        <span className="text-xs font-semibold text-slate-700 leading-tight">{preset.label}</span>
+                      </div>
+                      <span className="text-[10px] text-slate-400 ml-6">{preset.w} × {preset.h}px</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div className={`border-2 border-dashed rounded-xl p-4 transition-colors ${imageSrc && imageSrc.startsWith('data:') ? 'border-green-400 bg-green-50' : 'border-slate-200 hover:border-indigo-400 bg-slate-50'}`}>
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <Upload className="text-slate-400 w-5 h-5 flex-shrink-0" />
+                  <span className="text-sm text-slate-600">
+                    {imageSrc && imageSrc.startsWith('data:') ? 'Custom floor plan loaded' : 'Or upload a custom floor plan…'}
+                  </span>
+                  <input type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
+                </label>
+              </div>
             </div>
 
+            <div>
+              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">2. Tracking Data (CSV)</p>
             <div className={`border-2 border-dashed rounded-xl p-6 transition-colors ${(csvData.body.length > 0 || csvData.touches.length > 0) ? 'border-green-400 bg-green-50' : csvLoading ? 'border-indigo-300 bg-indigo-50' : 'border-slate-300 hover:border-indigo-400 bg-slate-50'}`}>
               <label className="flex flex-col items-center cursor-pointer">
                 {csvLoading
@@ -1192,11 +1229,12 @@ export default function App() {
                     ? 'Parsing CSV… (large files may take a moment)'
                     : (csvData.body.length > 0 || csvData.touches.length > 0)
                       ? `CSV Loaded: ${csvData.body.length} bodies, ${csvData.touches.length} touches`
-                      : '2. Upload Tracking Data (CSV)'}
+                      : 'Upload Tracking Data (CSV)'}
                 </span>
                 <span className="text-xs text-slate-500 mt-1">Must contain 'bcid', 'floor_pt_fused', and optionally 'touches'</span>
                 <input type="file" accept=".csv" className="hidden" onChange={handleCsvUpload} disabled={csvLoading} />
               </label>
+            </div>
             </div>
 
             <button
