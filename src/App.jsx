@@ -71,6 +71,14 @@ export default function App() {
   const [selectedZones, setSelectedZones] = useState(new Set()); // empty = show all
   const [showZoneOverlay, setShowZoneOverlay] = useState(false);
 
+  // Staff detection
+  const [staffZones, setStaffZones] = useState(new Set()); // zone IDs marked as staff areas
+  const [staffDwellMinSec, setStaffDwellMinSec] = useState(300); // 5 min default
+  const [swapDistPx, setSwapDistPx] = useState(80);
+  const [swapTimeGapSec, setSwapTimeGapSec] = useState(10);
+  const [showStaffOnMap, setShowStaffOnMap] = useState(true);
+  const [staffZoneDrawMode, setStaffZoneDrawMode] = useState(false);
+
   // Helper to trace up the merge tree to find the ultimate parent track representative
   const getMergedRepresentative = (bcid, currentMerges) => {
     let visited = new Set();
@@ -488,6 +496,79 @@ export default function App() {
     return result;
   }, [appState, csvData.body, scaleCoordinates, resolution, dwellRadiusPx, dwellMinSec, gridCols, gridRows]);
 
+  // Staff detection: tag BCIDs that dwell in staff zones long enough
+  const staffBcids = useMemo(() => {
+    if (appState !== 'map' || staffZones.size === 0 || csvData.body.length === 0) return new Set();
+    const tagged = new Set();
+    // Group by BCID and check cumulative time spent in staff zones
+    const tracks = {};
+    csvData.body.forEach(pt => {
+      if (!tracks[pt.bcid]) tracks[pt.bcid] = [];
+      tracks[pt.bcid].push(pt);
+    });
+    Object.entries(tracks).forEach(([bcid, pts]) => {
+      const sorted = pts.slice().sort((a, b) => a.timestamp - b.timestamp);
+      let staffMs = 0;
+      for (let i = 0; i < sorted.length - 1; i++) {
+        const x = scaleCoordinates ? sorted[i].rawX * resolution.width : sorted[i].rawX;
+        const y = scaleCoordinates ? sorted[i].rawY * resolution.height : sorted[i].rawY;
+        if (staffZones.has(getZoneId(x, y))) {
+          staffMs += sorted[i + 1].timestamp - sorted[i].timestamp;
+        }
+      }
+      if (staffMs >= staffDwellMinSec * 1000) tagged.add(bcid);
+    });
+    return tagged;
+  }, [appState, csvData.body, staffZones, staffDwellMinSec, scaleCoordinates, resolution, gridCols, gridRows]);
+
+  // ID swap detection: staff BCID and shopper BCID close in space+time → potential swap
+  const idSwapEvents = useMemo(() => {
+    if (appState !== 'map' || staffBcids.size === 0 || csvData.body.length === 0) return [];
+    const events = [];
+    const swapMs = swapTimeGapSec * 1000;
+    // Index shopper points by ~second bucket for fast lookup
+    const shopperIndex = {};
+    csvData.body.forEach(pt => {
+      if (staffBcids.has(pt.bcid)) return;
+      const bucket = Math.floor(pt.timestamp / 1000);
+      if (!shopperIndex[bucket]) shopperIndex[bucket] = [];
+      shopperIndex[bucket].push(pt);
+    });
+    // For each staff point, check nearby shopper points in time window
+    const seen = new Set();
+    csvData.body.forEach(staffPt => {
+      if (!staffBcids.has(staffPt.bcid)) return;
+      const sx = scaleCoordinates ? staffPt.rawX * resolution.width : staffPt.rawX;
+      const sy = scaleCoordinates ? staffPt.rawY * resolution.height : staffPt.rawY;
+      const bucketStart = Math.floor((staffPt.timestamp - swapMs) / 1000);
+      const bucketEnd   = Math.floor((staffPt.timestamp + swapMs) / 1000);
+      for (let b = bucketStart; b <= bucketEnd; b++) {
+        (shopperIndex[b] || []).forEach(shopperPt => {
+          const key = `${staffPt.bcid}|${shopperPt.bcid}`;
+          if (seen.has(key)) return;
+          const timeDiff = Math.abs(shopperPt.timestamp - staffPt.timestamp);
+          if (timeDiff > swapMs) return;
+          const px = scaleCoordinates ? shopperPt.rawX * resolution.width : shopperPt.rawX;
+          const py = scaleCoordinates ? shopperPt.rawY * resolution.height : shopperPt.rawY;
+          const dist = Math.hypot(px - sx, py - sy);
+          if (dist <= swapDistPx) {
+            seen.add(key);
+            events.push({
+              staffBcid: staffPt.bcid,
+              shopperBcid: shopperPt.bcid,
+              timestamp: staffPt.timestamp,
+              x: (sx + px) / 2,
+              y: (sy + py) / 2,
+              dist: Math.round(dist),
+              timeDiffMs: timeDiff,
+            });
+          }
+        });
+      }
+    });
+    return events.sort((a, b) => a.timestamp - b.timestamp).slice(0, 200); // cap at 200
+  }, [appState, csvData.body, staffBcids, swapDistPx, swapTimeGapSec, scaleCoordinates, resolution]);
+
   // Zone transition matrix + zone traffic density
   const { transitionMatrix, zoneDensity } = useMemo(() => {
     if (appState !== 'map') return { transitionMatrix: {}, zoneDensity: {} };
@@ -852,11 +933,14 @@ export default function App() {
       if (pairHiddenBcids.has(repBcid)) return;
       if (searchQuery && !repBcid.toLowerCase().includes(searchQuery.toLowerCase())) return;
 
+      const isStaff = staffBcids.has(repBcid);
+      if (isStaff && !showStaffOnMap) return;
       const color = colorBy === 'scid'
         ? (scidColors[sortedPoints[0]?.scid] || '#ccc')
+        : isStaff ? '#94a3b8' // staff = slate grey
         : (bcidColors[repBcid] || '#ccc');
-      // Dim non-focused paths when a focus is active
-      ctx.globalAlpha = focusedBcid && focusedBcid !== repBcid ? 0.12 : 1;
+      // Dim non-focused paths when a focus is active; also dim staff slightly
+      ctx.globalAlpha = focusedBcid && focusedBcid !== repBcid ? 0.12 : isStaff ? 0.5 : 1;
 
       // In animation mode, slice to points up to currentMaxTs (array is pre-sorted)
       // Also filter by selected zones, hidden SCIDs
@@ -879,18 +963,28 @@ export default function App() {
       if (renderMode === 'dots') {
         visiblePoints.forEach(point => {
           const isTouch = point.type === 'touch';
-          ctx.beginPath();
-          ctx.arc(dx(point), dy(point), isTouch ? 9 : 4, 0, 2 * Math.PI);
-          ctx.fillStyle = color;
-          ctx.fill();
-          ctx.lineWidth = 1;
-          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-          ctx.stroke();
-          if (isTouch) {
-            ctx.font = '12px Arial';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('🖐️', dx(point), dy(point));
+          const px = dx(point), py = dy(point);
+          if (isStaff) {
+            // Staff: small grey square
+            ctx.fillStyle = color;
+            ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+            ctx.lineWidth = 1;
+            ctx.fillRect(px - 3, py - 3, 6, 6);
+            ctx.strokeRect(px - 3, py - 3, 6, 6);
+          } else {
+            ctx.beginPath();
+            ctx.arc(px, py, isTouch ? 9 : 4, 0, 2 * Math.PI);
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+            ctx.stroke();
+            if (isTouch) {
+              ctx.font = '12px Arial';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.fillText('🖐️', px, py);
+            }
           }
         });
       } else {
@@ -1095,7 +1189,51 @@ export default function App() {
         ctx.restore();
       });
     }
-  }, [appState, sortedGroupedData, stitchedSegments, pairHiddenBcids, hiddenBcids, hiddenScids, bcidColors, scidColors, colorBy, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones, focusedBcid, showGapBridges, showScidCoverage, scidStats]);
+    // 6. Staff zone overlay
+    if (staffZones.size > 0) {
+      const cellW = resolution.width / gridCols;
+      const cellH = resolution.height / gridRows;
+      ctx.save();
+      staffZones.forEach(zoneId => {
+        const [col, row] = zoneId.split(':').map(Number);
+        ctx.fillStyle = 'rgba(239,68,68,0.15)';
+        ctx.strokeStyle = 'rgba(239,68,68,0.7)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.fillRect(col * cellW, row * cellH, cellW, cellH);
+        ctx.strokeRect(col * cellW, row * cellH, cellW, cellH);
+      });
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // 7. ID swap event markers
+    if (idSwapEvents.length > 0) {
+      idSwapEvents.forEach(ev => {
+        ctx.save();
+        ctx.globalAlpha = 0.85;
+        // Pulsing ring
+        ctx.beginPath();
+        ctx.arc(ev.x, ev.y, 14, 0, 2 * Math.PI);
+        ctx.strokeStyle = '#f97316';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // ⚡ label
+        ctx.font = 'bold 11px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.beginPath();
+        ctx.roundRect(ev.x - 14, ev.y + 15, 28, 13, 3);
+        ctx.fill();
+        ctx.fillStyle = '#fed7aa';
+        ctx.fillText('SWAP?', ev.x, ev.y + 21);
+        ctx.restore();
+      });
+    }
+  }, [appState, sortedGroupedData, stitchedSegments, pairHiddenBcids, hiddenBcids, hiddenScids, bcidColors, scidColors, colorBy, searchQuery, renderMode, dataSource, hoveredSuggestion, showZoneOverlay, zoneDensity, gridCols, gridRows, animProgress, timeRange, selectedZones, focusedBcid, showGapBridges, showScidCoverage, scidStats, staffZones, staffBcids, idSwapEvents, showStaffOnMap, resolution]);
 
   // Click-to-focus: click a dot to isolate that BCID; click empty space to clear
   const handleCanvasClick = (e) => {
@@ -1112,6 +1250,16 @@ export default function App() {
       if (hiddenBcids.has(repBcid)) continue;
       const dist = Math.hypot((p.sx ?? p.x) - mouseX, (p.sy ?? p.y) - mouseY);
       if (dist < minDist) { minDist = dist; closest = repBcid; }
+    }
+    // Staff zone draw mode: toggle zone on click
+    if (staffZoneDrawMode) {
+      const zoneId = getZoneId(mouseX, mouseY);
+      setStaffZones(prev => {
+        const next = new Set(prev);
+        next.has(zoneId) ? next.delete(zoneId) : next.add(zoneId);
+        return next;
+      });
+      return;
     }
     setFocusedBcid(prev => (closest && closest !== prev) ? closest : null);
   };
@@ -1450,7 +1598,7 @@ export default function App() {
               ref={canvasRef}
               width={resolution.width}
               height={resolution.height}
-              className="absolute inset-0 w-full h-full z-10 cursor-crosshair"
+              className={`absolute inset-0 w-full h-full z-10 ${staffZoneDrawMode ? 'cursor-cell' : 'cursor-crosshair'}`}
               onClick={handleCanvasClick}
             />
 
@@ -1548,6 +1696,13 @@ export default function App() {
                 className={`flex-1 py-2 text-xs font-bold rounded-md transition-all flex items-center justify-center gap-1.5 ${sidebarTab === 'camera' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500 hover:text-slate-800'}`}
               >
                 📷 Camera
+              </button>
+              <button
+                onClick={() => setSidebarTab('staff')}
+                className={`flex-1 py-2 text-xs font-bold rounded-md transition-all flex items-center justify-center gap-1.5 ${sidebarTab === 'staff' ? 'bg-white shadow-sm text-rose-600' : 'text-slate-500 hover:text-slate-800'}`}
+              >
+                🦺 Staff
+                {staffBcids.size > 0 && <span className="bg-rose-500 text-white text-[10px] px-1.5 py-0.5 rounded-full leading-none font-extrabold">{staffBcids.size}</span>}
               </button>
             </div>
 
@@ -2211,6 +2366,107 @@ export default function App() {
                     })}
                     {Object.keys(scidStats).length === 0 && (
                       <p className="text-xs text-slate-400 text-center py-6">No SCID data found in CSV.<br/>Make sure your CSV has a <code>scid</code> column.</p>
+                    )}
+                  </div>
+                </>
+              ) : sidebarTab === 'staff' ? (
+                <>
+                  {/* Staff zone draw mode */}
+                  <div className="mb-4 p-3 bg-rose-50 border border-rose-200 rounded-lg">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-xs font-bold text-rose-700">Staff Zone Setup</span>
+                      <button
+                        onClick={() => setStaffZoneDrawMode(v => !v)}
+                        className={`text-[10px] font-bold px-2 py-1 rounded transition-colors ${staffZoneDrawMode ? 'bg-rose-600 text-white' : 'bg-white border border-rose-300 text-rose-600 hover:bg-rose-50'}`}
+                      >
+                        {staffZoneDrawMode ? '✏️ Drawing… (click map)' : '✏️ Draw Zones'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-rose-500 leading-snug mb-2">Click grid cells on the floor plan to mark areas where staff typically stay. BCIDs that dwell there long enough are tagged as staff.</p>
+                    {staffZones.size > 0 && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-rose-600">{staffZones.size} zone{staffZones.size !== 1 ? 's' : ''} marked</span>
+                        <button onClick={() => setStaffZones(new Set())} className="text-[10px] text-rose-400 hover:text-rose-700">Clear all</button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Thresholds */}
+                  <div className="mb-4 space-y-3 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                    <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Detection Thresholds</span>
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                        <span>Min time in staff zone</span>
+                        <span className="font-semibold text-slate-700">{staffDwellMinSec >= 60 ? `${Math.floor(staffDwellMinSec/60)}m ${staffDwellMinSec%60}s` : `${staffDwellMinSec}s`}</span>
+                      </div>
+                      <input type="range" min="30" max="1800" step="30" value={staffDwellMinSec} onChange={e => setStaffDwellMinSec(Number(e.target.value))} className="w-full accent-rose-500" />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                        <span>Swap proximity radius</span><span className="font-semibold text-slate-700">{swapDistPx}px</span>
+                      </div>
+                      <input type="range" min="20" max="300" step="10" value={swapDistPx} onChange={e => setSwapDistPx(Number(e.target.value))} className="w-full accent-orange-500" />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                        <span>Swap time window</span><span className="font-semibold text-slate-700">{swapTimeGapSec}s</span>
+                      </div>
+                      <input type="range" min="2" max="60" step="1" value={swapTimeGapSec} onChange={e => setSwapTimeGapSec(Number(e.target.value))} className="w-full accent-orange-500" />
+                    </div>
+                    <label className="flex items-center gap-2 text-[10px] text-slate-600 cursor-pointer">
+                      <input type="checkbox" checked={showStaffOnMap} onChange={e => setShowStaffOnMap(e.target.checked)} className="rounded" />
+                      Show staff tracks on map (greyed squares)
+                    </label>
+                  </div>
+
+                  {/* Detected staff */}
+                  <div className="mb-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Detected Staff ({staffBcids.size})</span>
+                    </div>
+                    {staffBcids.size === 0 ? (
+                      <p className="text-xs text-slate-400 text-center py-3">{staffZones.size === 0 ? 'Draw staff zones on the map first.' : 'No BCIDs exceeded the dwell threshold yet.'}</p>
+                    ) : (
+                      <div className="space-y-1 max-h-40 overflow-y-auto">
+                        {[...staffBcids].map(bcid => (
+                          <div key={bcid} className="flex items-center gap-2 px-2 py-1 bg-slate-100 rounded text-[10px] text-slate-600">
+                            <span className="w-3 h-3 rounded-sm bg-slate-400 flex-shrink-0" />
+                            <span className="font-mono truncate">{bcid}</span>
+                            <span className="ml-auto text-slate-400">staff</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ID swap events */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">ID Swap Events ({idSwapEvents.length})</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mb-2 leading-snug">Staff and shopper BCIDs detected in close proximity — possible tracking ID reassignment.</p>
+                    {idSwapEvents.length === 0 ? (
+                      <p className="text-xs text-slate-400 text-center py-3">{staffBcids.size === 0 ? 'Detect staff first.' : 'No swap events found with current thresholds.'}</p>
+                    ) : (
+                      <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                        {idSwapEvents.map((ev, i) => (
+                          <div
+                            key={i}
+                            onClick={() => { setFocusedBcid(ev.shopperBcid); setSidebarTab('legend'); }}
+                            className="p-2 bg-orange-50 border border-orange-200 rounded-lg cursor-pointer hover:bg-orange-100 transition-colors"
+                          >
+                            <div className="flex items-center gap-1.5 mb-1">
+                              <span className="text-[10px] font-bold text-orange-700">⚡ Swap #{i + 1}</span>
+                              <span className="text-[9px] text-orange-400 ml-auto">{new Date(ev.timestamp).toLocaleTimeString()}</span>
+                            </div>
+                            <div className="text-[10px] text-slate-600 space-y-0.5">
+                              <div>🦺 Staff: <span className="font-mono text-rose-600 font-semibold">{ev.staffBcid.slice(0, 12)}…</span></div>
+                              <div>🛒 Shopper: <span className="font-mono text-indigo-600 font-semibold">{ev.shopperBcid.slice(0, 12)}…</span></div>
+                              <div className="text-slate-400">{ev.dist}px apart · {Math.round(ev.timeDiffMs / 1000)}s gap</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
                 </>
